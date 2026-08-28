@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 import time
 import requests
@@ -7,13 +8,16 @@ import pandas as pd
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ================= CONFIGURAÇÕES DO ROBÔ =================
-EMAIL_CORRETORA = os.environ.get("IQ_EMAIL", "seu_email@exemplo.com")
-SENHA_CORRETORA = os.environ.get("IQ_PASSWORD", "sua_senha_aqui")
-TIPO_CONTA = os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE")  # PRACTICE ou REAL
+# Força o Python a exibir logs imediatamente
+sys.stdout.reconfigure(line_buffering=True)
 
-TG_TOKEN = os.environ.get("TG_TOKEN", "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "999294230")
+# ================= CONFIGURAÇÕES DO ROBÔ =================
+EMAIL_CORRETORA = os.environ.get("IQ_EMAIL", "").strip()
+SENHA_CORRETORA = os.environ.get("IQ_PASSWORD", "").strip()
+TIPO_CONTA = os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper()
+
+TG_TOKEN = os.environ.get("TG_TOKEN", "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "999294230").strip()
 
 PAR_OPERACAO = "EURUSD-OTC"
 PAR_EXIBICAO = "EUR/USD (OTC)"
@@ -27,15 +31,18 @@ PAYOUT_PADRAO = 0.85
 
 def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT_ID:
+        print("[TELEGRAM] Token ou Chat ID ausente!", flush=True)
         return
-    def _send():
-        try:
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-            payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-            requests.post(url, json=payload, timeout=8)
-        except Exception:
-            pass
-    threading.Thread(target=_send, daemon=True).start()
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"[TELEGRAM ERRO] Resposta: {resp.text}", flush=True)
+        else:
+            print("[TELEGRAM] Mensagem enviada com sucesso!", flush=True)
+    except Exception as e:
+        print(f"[TELEGRAM EXCEÇÃO] {e}", flush=True)
 
 class SorosManager:
     def __init__(self, banca_inicial, entrada_base, payout):
@@ -79,12 +86,8 @@ class BotCloudWorker:
 
     def conectar(self):
         try:
-            try:
-                from iqoptionapi.stable_api import IQ_Option
-            except ImportError:
-                from iqoptionapi.api import IQOptionAPI as IQ_Option
-
-            print(f"[NUVEM] Conectando à corretora como {EMAIL_CORRETORA}...")
+            from iqoptionapi.stable_api import IQ_Option
+            print(f"[NUVEM] Conectando à corretora como: {EMAIL_CORRETORA}...", flush=True)
             self.api = IQ_Option(EMAIL_CORRETORA, SENHA_CORRETORA)
             status, reason = self.api.connect()
 
@@ -93,7 +96,7 @@ class BotCloudWorker:
                 saldo = self.api.get_balance()
                 self.gerenciador.banca_inicial = saldo
                 self.gerenciador.banca_atual = saldo
-                print(f"[NUVEM] Conectado ({TIPO_CONTA}) | Saldo: R$ {saldo:.2f}")
+                print(f"[NUVEM] Conectado ({TIPO_CONTA}) | Saldo: R$ {saldo:.2f}", flush=True)
                 send_telegram(
                     f"🚀 *ROBÔ 24H INICIADO NA NUVEM*\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -106,58 +109,61 @@ class BotCloudWorker:
                 )
                 return True
             else:
-                print(f"[NUVEM] Falha ao autenticar: {reason}")
+                print(f"[NUVEM] Falha ao autenticar na corretora: {reason}", flush=True)
                 send_telegram(f"⚠️ *Falha ao conectar na corretora:* {reason}")
                 return False
         except Exception as e:
-            print(f"[NUVEM] Erro de conexão: {e}")
-            send_telegram(f"⚠️ *Erro crítico de conexão na Nuvem:* {e}")
+            print(f"[NUVEM] Erro crítico de conexão: {e}", flush=True)
+            send_telegram(f"⚠️ *Erro crítico de conexão:* {e}")
             return False
 
     def loop_operacional(self):
-        if not self.conectar():
-            time.sleep(10)
-            return
-
         while self.running:
-            try:
-                lucro_atual = self.gerenciador.banca_atual - self.gerenciador.banca_inicial
-                if lucro_atual >= STOP_WIN:
-                    send_telegram(f"🏆 *STOP WIN ATINGIDO NA NUVEM!*\n*Lucro Total:* `+R$ {lucro_atual:.2f}`\n*Banca Final:* `R$ {self.gerenciador.banca_atual:.2f}`")
+            if not self.conectar():
+                print("[NUVEM] Tentando reconectar em 15 segundos...", flush=True)
+                time.sleep(15)
+                continue
+
+            while self.running:
+                try:
+                    lucro_atual = self.gerenciador.banca_atual - self.gerenciador.banca_inicial
+                    if lucro_atual >= STOP_WIN:
+                        send_telegram(f"🏆 *STOP WIN ATINGIDO NA NUVEM!*\n*Lucro:* `+R$ {lucro_atual:.2f}`")
+                        break
+
+                    if lucro_atual <= -STOP_LOSS:
+                        send_telegram(f"⚠️ *STOP LOSS ATINGIDO NA NUVEM!*\n*Perda:* `-R$ {abs(lucro_atual):.2f}`")
+                        break
+
+                    time.sleep(1)
+                    segundos_atual = int(time.time()) % TIMEFRAME_SEGUNDOS
+
+                    if segundos_atual in [0, 1]:
+                        candles_raw = self.api.get_candles(PAR_OPERACAO, TIMEFRAME_SEGUNDOS, 50, time.time())
+                        if candles_raw and len(candles_raw) > 0:
+                            timestamp_vela = candles_raw[-1].get('from', 0)
+                            if timestamp_vela != self.ultima_vela_processada:
+                                self.ultima_vela_processada = timestamp_vela
+
+                                fechamentos = [c['close'] for c in candles_raw]
+                                df = pd.DataFrame({'close': fechamentos})
+                                df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
+                                df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+
+                                delta = df['close'].diff()
+                                gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
+                                loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
+                                rs = gain / (loss + 1e-9)
+                                rsi = (100 - (100 / (1 + rs))).iloc[-1]
+
+                                sinal, prob = self.analisar_sinal(df, rsi)
+                                if sinal in ["CALL", "PUT"]:
+                                    self.executar_ordem(sinal, rsi, prob)
+
+                except Exception as e:
+                    print(f"[NUVEM ERRO LOOP] {e}", flush=True)
+                    time.sleep(5)
                     break
-
-                if lucro_atual <= -STOP_LOSS:
-                    send_telegram(f"⚠️ *STOP LOSS ATINGIDO NA NUVEM!*\n*Perda Total:* `-R$ {abs(lucro_atual):.2f}`\n*Banca Atual:* `R$ {self.gerenciador.banca_atual:.2f}`")
-                    break
-
-                time.sleep(1)
-                segundos_atual = int(time.time()) % TIMEFRAME_SEGUNDOS
-
-                if segundos_atual in [0, 1]:
-                    candles_raw = self.api.get_candles(PAR_OPERACAO, TIMEFRAME_SEGUNDOS, 50, time.time())
-                    if candles_raw and len(candles_raw) > 0:
-                        timestamp_vela = candles_raw[-1].get('from', 0)
-                        if timestamp_vela != self.ultima_vela_processada:
-                            self.ultima_vela_processada = timestamp_vela
-
-                            fechamentos = [c['close'] for c in candles_raw]
-                            df = pd.DataFrame({'close': fechamentos})
-                            df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
-                            df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-
-                            delta = df['close'].diff()
-                            gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
-                            loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
-                            rs = gain / (loss + 1e-9)
-                            rsi = (100 - (100 / (1 + rs))).iloc[-1]
-
-                            sinal, prob = self.analisar_sinal(df, rsi)
-                            if sinal in ["CALL", "PUT"]:
-                                self.executar_ordem(sinal, rsi, prob)
-
-            except Exception as e:
-                print(f"[NUVEM ERRO LOOP] {e}")
-                time.sleep(5)
 
     def analisar_sinal(self, df, rsi):
         p = df['close'].iloc[-1]
@@ -262,19 +268,34 @@ class BotCloudWorker:
             f"━━━━━━━━━━━━━━━━━━━━"
         )
 
+# Servidor Web com suporte a HEAD e GET (para o Render não reclamar)
 class HealthHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain; charset=utf-8')
         self.end_headers()
         self.wfile.write(b"Apex Trading Bot Cloud 24/7 Ativo e Operando.")
 
+    def log_message(self, format, *args):
+        pass
+
 def iniciar_servidor_web():
     porta = int(os.environ.get("PORT", 8080))
     servidor = HTTPServer(('0.0.0.0', porta), HealthHandler)
+    print(f"[NUVEM] Servidor Web ativo na porta {porta}", flush=True)
     servidor.serve_forever()
 
 if __name__ == "__main__":
+    print("[NUVEM] Iniciando Worker do Robô...", flush=True)
+    
+    # Teste imediato do Telegram
+    send_telegram("⚡ *Robô inicializado no Render. Conectando à corretora...*")
+
     worker = BotCloudWorker()
     t_bot = threading.Thread(target=worker.loop_operacional, daemon=True)
     t_bot.start()
