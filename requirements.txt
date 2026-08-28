@@ -1,0 +1,5 @@
+requests
+pandas
+numpy
+iqoptionapi-v2
+websocket-client
