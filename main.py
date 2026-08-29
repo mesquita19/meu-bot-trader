@@ -3,20 +3,51 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import numpy as np
 import requests
 
-# ================= CREDENCIAIS & CONFIGURAÇÕES =================
-TG_TOKEN = "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8"
-TG_CHAT_ID = "999294230"
+# ================= SERVIDOR HTTP PARA MANTER O RENDER VIVO =================
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        html = f"""
+        <html>
+        <head><title>Apex Quant Engine v3.0</title></head>
+        <body style="background:#0f172a; color:#38bdf8; font-family:sans-serif; text-align:center; padding-top:50px;">
+            <h1>🏛️ Apex Quant Neural Engine v3.0</h1>
+            <p style="color:#22c55e; font-size:1.2rem;">● Sistema Operando 24/7 na Nuvem</p>
+            <p style="color:#94a3b8;">Status da Conexao: Ativa | Multi-Timeframe M1/M5/M15/H1</p>
+        </body>
+        </html>
+        """
+        self.wfile.write(html.encode('utf-8'))
 
-EMAIL_IQ = os.environ.get("IQ_EMAIL", "").strip()
+    def log_message(self, format, *args):
+        return  # Silencia logs de requisição para manter o console limpo
+
+def iniciar_servidor_http():
+    porta = int(os.environ.get("PORT", 10000))
+    servidor = HTTPServer(('0.0.0.0', porta), KeepAliveHandler)
+    print(f"🌐 [HTTP SERVER] Porta {porta} aberta com sucesso para o Render!", flush=True)
+    servidor.serve_forever()
+
+# Inicia o servidor HTTP em uma thread separada imediatamente
+threading.Thread(target=iniciar_servidor_http, daemon=True).start()
+# ==========================================================================
+
+# ================= CREDENCIAIS & CONFIGURAÇÕES =================
+TG_TOKEN = os.environ.get("TG_TOKEN", "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "999294230").strip()
+
+EMAIL_IQ = os.environ.get("IQ_EMAIL", "ceatecnology@gmail.com").strip()
 SENHA_IQ = os.environ.get("IQ_PASSWORD", "").strip()
 TIPO_CONTA = os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
-SCORE_MINIMO_EXECUCAO = 85.0  # Só opera confluência institucional altíssima
-PAYOUT_MINIMO = 0.80          # Rejeita ativos com retorno baixo
+SCORE_MINIMO_EXECUCAO = 85.0  # Confluência rigorosa
 ENTRADA_BASE = 20.0
 STOP_WIN = 60.0
 STOP_LOSS = 40.0
@@ -34,8 +65,6 @@ def send_telegram(msg):
     threading.Thread(target=_post, daemon=True).start()
 
 class QuantAnalytics:
-    """Módulo matemático para cálculo de indicadores sem ruído"""
-    
     @staticmethod
     def calcular_ema(series, span):
         return series.ewm(span=span, adjust=False).mean()
@@ -78,33 +107,27 @@ class QuantAnalytics:
 
     @staticmethod
     def calcular_rejeicao_pavio(df):
-        """Avalia micro-estrutura de Price Action no 1M"""
         ultimo = df.iloc[-1]
         corpo = abs(ultimo['close'] - ultimo['open'])
         pavio_superior = ultimo['high'] - max(ultimo['close'], ultimo['open'])
         pavio_inferior = min(ultimo['close'], ultimo['open']) - ultimo['low']
         
-        # Rejeição de fundo (pavio inferior longo) -> Força compradora
         rejeicao_alta = pavio_inferior > (corpo * 1.5)
-        # Rejeição de topo (pavio superior longo) -> Força vendedora
         rejeicao_baixa = pavio_superior > (corpo * 1.5)
-        
         return rejeicao_alta, rejeicao_baixa
 
 class WeeklyAdaptiveMatrix:
-    """Treinamento contínuo: analisa 7 dias de histórico e ranqueia ativos/horários"""
     def __init__(self, api):
         self.api = api
-        self.heatmap_assertividade = {} # { "EURUSD": { 14: 78.5 } } -> Par, Hora, Taxa %
+        self.heatmap_assertividade = {}
         self.ultimo_treino = None
 
     def executar_aprendizado_semanal(self, lista_ativos):
         print("\n🧠 [NEURAL MATRIX] Iniciando varredura semanal (Walk-Forward Analysis)...", flush=True)
         nova_matriz = {}
         
-        for par in lista_ativos[:15]: # Avalia os principais pares
+        for par in lista_ativos[:15]:
             try:
-                # Baixa histórico amplo (M15 e 1H)
                 velas = self.api.get_candles(par, 900, 400, time.time())
                 if not velas or len(velas) < 100:
                     continue
@@ -118,7 +141,6 @@ class WeeklyAdaptiveMatrix:
                     total = len(grupo)
                     if total > 5:
                         taxa = (grupo['resultado'].sum() / total) * 100.0
-                        # Normaliza para direção dominante
                         assertividade = max(taxa, 100.0 - taxa)
                         stats_por_hora[hora] = round(assertividade, 1)
                 
@@ -165,7 +187,6 @@ class ApexQuantEngine:
             self.conectado = True
             self.matriz = WeeklyAdaptiveMatrix(self.api)
             
-            # Mapeia todos os ativos reais, crypto, forex e OTC
             self.sincronizar_universo_ativos()
             
             send_telegram(
@@ -176,9 +197,8 @@ class ApexQuantEngine:
                 f"🎯 *Filtro de Execução:* `Score Institucional ≥ {SCORE_MINIMO_EXECUCAO}%`\n"
                 f"📊 *Timeframes:* `1H (Macro) + 15M (VWAP) + 5M (ADX) + 1M (Micro)`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🟢 *Status:* _Varredura Neural Ativa 24/7._"
+                f"🟢 *Status:* _Varredura Neural Ativa 24/7 na Nuvem._"
             )
-            # Executa primeiro ciclo de aprendizado semanal
             threading.Thread(target=self.matriz.executar_aprendizado_semanal, args=(self.ativos_monitorados,), daemon=True).start()
             return True
         else:
@@ -186,7 +206,6 @@ class ApexQuantEngine:
             return False
 
     def sincronizar_universo_ativos(self):
-        """Coleta 100% dos ativos abertos em Forex, Cripto, Binárias, Turbo e OTC"""
         try:
             todos = self.api.get_all_open_time()
             encontrados = set()
@@ -200,9 +219,7 @@ class ApexQuantEngine:
             self.ativos_monitorados = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURUSD", "GBPUSD"]
 
     def avaliar_confluencia_multi_timeframe(self, par):
-        """Avalia 1H, 15M, 5M e 1M gerando pontuação de 0 a 100"""
         try:
-            # 1. MACRO 1H (Tendência Soberana)
             velas_1h = self.api.get_candles(par, 3600, 50, time.time())
             if not velas_1h or len(velas_1h) < 30:
                 return None, 0
@@ -211,14 +228,12 @@ class ApexQuantEngine:
             preco_macro = df_1h['close'].iloc[-1]
             tendencia_macro = "ALTA" if preco_macro > ema200_1h else "BAIXA"
 
-            # 2. ESTRUTURA 15M (Força & ADX)
             velas_15m = self.api.get_candles(par, 900, 30, time.time())
             if not velas_15m:
                 return None, 0
             df_15m = pd.DataFrame(velas_15m)
             adx_15m = self.analise.calcular_adx(df_15m, 14)
 
-            # 3. GATILHO MICRO 1M (Stoch RSI + Price Action)
             velas_1m = self.api.get_candles(par, 60, 35, time.time())
             if not velas_1m or len(velas_1m) < 25:
                 return None, 0
@@ -226,28 +241,24 @@ class ApexQuantEngine:
             stoch_rsi_1m = self.analise.calcular_stoch_rsi(df_1m['close'])
             rejeicao_alta, rejeicao_baixa = self.analise.calcular_rejeicao_pavio(df_1m)
 
-            # 4. HEATMAP HISTÓRICO
             score_historico = self.matriz.obter_score_historico(par)
 
-            # CÁLCULO DO SCORE PONDERADO
             score = 0.0
             direcao = None
 
-            # Condições para COMPRA (CALL)
             if tendencia_macro == "ALTA":
-                score += 30.0 # Macro alinhada
-                if adx_15m >= 22.0: score += 20.0 # Mercado com tendência ativa (não lateral)
-                if 20.0 <= stoch_rsi_1m <= 45.0: score += 20.0 # Pullback em zona compradora
-                if rejeicao_alta: score += 15.0 # Defesa dos compradores
-                score += (score_historico * 0.15) # Peso estatístico semanal
+                score += 30.0
+                if adx_15m >= 22.0: score += 20.0
+                if 20.0 <= stoch_rsi_1m <= 45.0: score += 20.0
+                if rejeicao_alta: score += 15.0
+                score += (score_historico * 0.15)
                 direcao = "CALL"
 
-            # Condições para VENDA (PUT)
             elif tendencia_macro == "BAIXA":
-                score += 30.0 # Macro alinhada
+                score += 30.0
                 if adx_15m >= 22.0: score += 20.0
-                if 55.0 <= stoch_rsi_1m <= 80.0: score += 20.0 # Pullback em zona vendedora
-                if rejeicao_baixa: score += 15.0 # Defesa dos vendedores
+                if 55.0 <= stoch_rsi_1m <= 80.0: score += 20.0
+                if rejeicao_baixa: score += 15.0
                 score += (score_historico * 0.15)
                 direcao = "PUT"
 
@@ -271,7 +282,6 @@ class ApexQuantEngine:
             f"━━━━━━━━━━━━━━━━━━━━"
         )
 
-        # Execução Inteligente (Digital Spot com Fallback para Binárias)
         id_ordem = None
         tipo_exec = "DIGITAL"
         try:
@@ -350,10 +360,9 @@ class ApexQuantEngine:
                     time.sleep(15)
                     continue
 
-            # Trava de Segurança Diária (Stop Win / Stop Loss)
             lucro_dia = self.banca_atual - self.banca_inicio_dia
             if lucro_dia >= STOP_WIN:
-                send_telegram(f"🏆 *STOP WIN ALCANÇADO!* Lucro: `+R$ {lucro_dia:.2f}`. Pausando por segurança.")
+                send_telegram(f"🏆 *STOP WIN ALCANÇADO!* Lucro: `+R$ {lucro_dia:.2f}`. Pausando até o próximo ciclo.")
                 time.sleep(3600 * 8)
                 continue
             elif lucro_dia <= -STOP_LOSS:
@@ -364,7 +373,6 @@ class ApexQuantEngine:
             time.sleep(1)
             segundo = int(time.time()) % 60
 
-            # Dispara análise rigorosa na virada da vela (segundo 0 e 1)
             if segundo in [0, 1] and not self.operando_lock:
                 melhor_par = None
                 melhor_direcao = None
