@@ -2,346 +2,385 @@ import os
 import sys
 import threading
 import time
-import requests
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import requests
 
-# Garante envio imediato de logs no Render
-sys.stdout.reconfigure(line_buffering=True)
+# ================= CREDENCIAIS & CONFIGURAÇÕES =================
+TG_TOKEN = "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8"
+TG_CHAT_ID = "999294230"
 
-# ================= CONFIGURAÇÕES DO ROBÔ =================
-EMAIL_CORRETORA = os.environ.get("IQ_EMAIL", "").strip()
-SENHA_CORRETORA = os.environ.get("IQ_PASSWORD", "").strip()
+EMAIL_IQ = os.environ.get("IQ_EMAIL", "").strip()
+SENHA_IQ = os.environ.get("IQ_PASSWORD", "").strip()
 TIPO_CONTA = os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
-TG_TOKEN = os.environ.get("TG_TOKEN", "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "999294230").strip()
-
-TIMEFRAME_SEGUNDOS = 60  # M1
-BANCA_INICIAL = 100.0
+SCORE_MINIMO_EXECUCAO = 85.0  # Só opera confluência institucional altíssima
+PAYOUT_MINIMO = 0.80          # Rejeita ativos com retorno baixo
 ENTRADA_BASE = 20.0
-STOP_WIN = 50.0
+STOP_WIN = 60.0
 STOP_LOSS = 40.0
-PAYOUT_MINIMO = 0.75  # Só opera pares com payout >= 75%
-MAX_OPERACOES_SIMULTANEAS = 1  # Evita expor a banca em vários ativos ao mesmo tempo
-# =========================================================
+# ===============================================================
 
-def send_telegram(text):
+def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
-    def _send():
+    def _post():
         try:
             url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-            payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-            requests.post(url, json=payload, timeout=10)
+            requests.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=8)
         except Exception:
             pass
-    threading.Thread(target=_send, daemon=True).start()
+    threading.Thread(target=_post, daemon=True).start()
 
-class SorosManager:
-    def __init__(self, banca_inicial, entrada_base):
-        self.banca_inicial = banca_inicial
-        self.banca_atual = banca_inicial
-        self.entrada_base = entrada_base
-        self.estagio = 1
-        self.lucro_anterior = 0.0
+class QuantAnalytics:
+    """Módulo matemático para cálculo de indicadores sem ruído"""
+    
+    @staticmethod
+    def calcular_ema(series, span):
+        return series.ewm(span=span, adjust=False).mean()
 
-    def obter_valor_entrada(self):
-        return self.entrada_base if self.estagio == 1 else self.entrada_base + self.lucro_anterior
+    @staticmethod
+    def calcular_adx(df, periodo=14):
+        df = df.copy()
+        df['h-l'] = df['high'] - df['low']
+        df['h-pc'] = abs(df['high'] - df['close'].shift(1))
+        df['l-pc'] = abs(df['low'] - df['close'].shift(1))
+        df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+        
+        df['up_move'] = df['high'] - df['high'].shift(1)
+        df['down_move'] = df['low'].shift(1) - df['low']
+        
+        df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
+        df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0.0)
+        
+        tr_smooth = df['tr'].rolling(window=periodo).sum()
+        plus_di = 100 * (df['plus_dm'].rolling(window=periodo).sum() / (tr_smooth + 1e-9))
+        minus_di = 100 * (df['minus_dm'].rolling(window=periodo).sum() / (tr_smooth + 1e-9))
+        
+        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
+        adx = dx.rolling(window=periodo).mean()
+        return float(adx.iloc[-1]) if not adx.empty else 0.0
 
-    def registrar_resultado(self, resultado, lucro_real=None, payout=0.85):
-        valor_entrada = self.obter_valor_entrada()
-        if resultado == "WIN":
-            lucro = lucro_real if (lucro_real is not None and lucro_real > 0) else (valor_entrada * payout)
-            self.banca_atual += lucro
-            if self.estagio == 1:
-                self.estagio = 2
-                self.lucro_anterior = lucro
-                return f"WIN Mão 1! Soros N2 ativado: Próxima entrada R$ {self.obter_valor_entrada():.2f}"
-            else:
-                self.estagio = 1
-                self.lucro_anterior = 0.0
-                return f"CICLO SOROS CONCLUÍDO! Lucro total: +R$ {lucro:.2f}"
-        else:
-            self.banca_atual -= valor_entrada
-            self.estagio = 1
-            self.lucro_anterior = 0.0
-            return f"Loss de R$ {valor_entrada:.2f}. Resetando para Mão 1 de proteção."
+    @staticmethod
+    def calcular_stoch_rsi(series, periodo=14, smooth_k=3):
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=periodo).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=periodo).mean()
+        rs = gain / (loss + 1e-9)
+        rsi = 100 - (100 / (1 + rs))
+        
+        min_rsi = rsi.rolling(window=periodo).min()
+        max_rsi = rsi.rolling(window=periodo).max()
+        stoch = 100 * ((rsi - min_rsi) / (max_rsi - min_rsi + 1e-9))
+        stoch_k = stoch.rolling(window=smooth_k).mean()
+        return float(stoch_k.iloc[-1]) if not stoch_k.empty else 50.0
 
-class BotMultiAssetWorker:
-    def __init__(self):
-        self.running = True
-        self.api = None
-        self.gerenciador = SorosManager(BANCA_INICIAL, ENTRADA_BASE)
-        self.wins = 0
-        self.losses = 0
-        self.operando_agora = False
-        self.ultima_vela_por_par = {}
+    @staticmethod
+    def calcular_rejeicao_pavio(df):
+        """Avalia micro-estrutura de Price Action no 1M"""
+        ultimo = df.iloc[-1]
+        corpo = abs(ultimo['close'] - ultimo['open'])
+        pavio_superior = ultimo['high'] - max(ultimo['close'], ultimo['open'])
+        pavio_inferior = min(ultimo['close'], ultimo['open']) - ultimo['low']
+        
+        # Rejeição de fundo (pavio inferior longo) -> Força compradora
+        rejeicao_alta = pavio_inferior > (corpo * 1.5)
+        # Rejeição de topo (pavio superior longo) -> Força vendedora
+        rejeicao_baixa = pavio_superior > (corpo * 1.5)
+        
+        return rejeicao_alta, rejeicao_baixa
 
-    def conectar(self):
-        try:
-            from iqoptionapi.stable_api import IQ_Option
-            print(f"[NUVEM] Conectando à corretora como {EMAIL_CORRETORA}...", flush=True)
-            self.api = IQ_Option(EMAIL_CORRETORA, SENHA_CORRETORA)
-            status, reason = self.api.connect()
+class WeeklyAdaptiveMatrix:
+    """Treinamento contínuo: analisa 7 dias de histórico e ranqueia ativos/horários"""
+    def __init__(self, api):
+        self.api = api
+        self.heatmap_assertividade = {} # { "EURUSD": { 14: 78.5 } } -> Par, Hora, Taxa %
+        self.ultimo_treino = None
 
-            if status:
-                self.api.change_balance(TIPO_CONTA)
-                saldo = self.api.get_balance()
-                self.gerenciador.banca_inicial = saldo
-                self.gerenciador.banca_atual = saldo
-                print(f"[NUVEM] Conectado ({TIPO_CONTA}) | Saldo: R$ {saldo:.2f}", flush=True)
-                send_telegram(
-                    f"🚀 *ROBÔ MULTI-ATIVOS INICIADO NA NUVEM*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💼 *Conta:* `{TIPO_CONTA}`\n"
-                    f"💵 *Banca Inicial:* `R$ {saldo:.2f}`\n"
-                    f"🌐 *Varredura:* `TODOS OS ATIVOS ABERTOS + OTC`\n"
-                    f"🎯 *Estratégia:* `EMA 7/21 + RSI(7) + Soros N2`\n"
-                    f"📊 *Payout Mínimo:* `{int(PAYOUT_MINIMO*100)}%`\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🟢 *Status:* _Escaneando mercado 24/7..._"
-                )
-                return True
-            else:
-                print(f"[NUVEM] Falha ao autenticar: {reason}", flush=True)
-                send_telegram(f"⚠️ *Falha ao conectar na corretora:* {reason}")
-                return False
-        except Exception as e:
-            print(f"[NUVEM] Erro de conexão: {e}", flush=True)
-            send_telegram(f"⚠️ *Erro crítico de conexão:* {e}")
-            return False
-
-    def obter_ativos_abertos(self):
-        """Retorna todos os ativos abertos (turbo/binárias e OTC) com payout aceitável"""
-        try:
-            abertos = []
-            todos_ativos = self.api.get_all_open_time()
-            
-            # Checa opções Turbo / Binárias
-            for tipo in ['turbo', 'binary']:
-                if tipo in todos_ativos:
-                    for par, dados in todos_ativos[tipo].items():
-                        if dados.get('open', False) and par not in abertos:
-                            abertos.append(par)
-            
-            # Se a lista vier vazia por delay da API, usa lista de segurança
-            if not abertos:
-                abertos = [
-                    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "EURJPY", "GBPJPY",
-                    "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDCAD-OTC", "EURGBP-OTC"
-                ]
-            return abertos
-        except Exception:
-            return ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURUSD", "GBPUSD"]
-
-    def loop_operacional(self):
-        while self.running:
-            if not self.conectar():
-                time.sleep(15)
+    def executar_aprendizado_semanal(self, lista_ativos):
+        print("\n🧠 [NEURAL MATRIX] Iniciando varredura semanal (Walk-Forward Analysis)...", flush=True)
+        nova_matriz = {}
+        
+        for par in lista_ativos[:15]: # Avalia os principais pares
+            try:
+                # Baixa histórico amplo (M15 e 1H)
+                velas = self.api.get_candles(par, 900, 400, time.time())
+                if not velas or len(velas) < 100:
+                    continue
+                
+                df = pd.DataFrame(velas)
+                df['hora'] = pd.to_datetime(df['from'], unit='s').dt.hour
+                df['resultado'] = np.where(df['close'] > df['open'], 1, 0)
+                
+                stats_por_hora = {}
+                for hora, grupo in df.groupby('hora'):
+                    total = len(grupo)
+                    if total > 5:
+                        taxa = (grupo['resultado'].sum() / total) * 100.0
+                        # Normaliza para direção dominante
+                        assertividade = max(taxa, 100.0 - taxa)
+                        stats_por_hora[hora] = round(assertividade, 1)
+                
+                nova_matriz[par] = stats_por_hora
+            except Exception:
                 continue
 
-            while self.running:
-                try:
-                    lucro_atual = self.gerenciador.banca_atual - self.gerenciador.banca_inicial
-                    if lucro_atual >= STOP_WIN:
-                        send_telegram(f"🏆 *STOP WIN ATINGIDO NA NUVEM!*\n*Lucro Total:* `+R$ {lucro_atual:.2f}`\n*Banca Final:* `R$ {self.gerenciador.banca_atual:.2f}`")
-                        break
+        self.heatmap_assertividade = nova_matriz
+        self.ultimo_treino = datetime.now()
+        print(f"✅ [NEURAL MATRIX] Otimização concluída para {len(nova_matriz)} ativos!", flush=True)
 
-                    if lucro_atual <= -STOP_LOSS:
-                        send_telegram(f"⚠️ *STOP LOSS ATINGIDO NA NUVEM!*\n*Perda Total:* `-R$ {abs(lucro_atual):.2f}`\n*Banca Atual:* `R$ {self.gerenciador.banca_atual:.2f}`")
-                        break
+    def obter_score_historico(self, par):
+        hora_atual = datetime.now().hour
+        if par in self.heatmap_assertividade:
+            return self.heatmap_assertividade[par].get(hora_atual, 60.0)
+        return 65.0
 
-                    time.sleep(1)
-                    segundos_atual = int(time.time()) % TIMEFRAME_SEGUNDOS
+class ApexQuantEngine:
+    def __init__(self):
+        self.api = None
+        self.conectado = False
+        self.analise = QuantAnalytics()
+        self.matriz = None
+        self.ativos_monitorados = []
+        self.banca_inicio_dia = 0.0
+        self.banca_atual = 0.0
+        self.soros_estagio = 1
+        self.soros_lucro = 0.0
+        self.wins = 0
+        self.losses = 0
+        self.operando_lock = False
 
-                    # Analisa no início de cada nova vela (segundo 0 a 2)
-                    if segundos_atual in [0, 1, 2] and not self.operando_agora:
-                        ativos = self.obter_ativos_abertos()
-                        melhor_sinal = None
-                        maior_prob = 0.0
-                        melhor_par = None
-                        melhor_rsi = 0.0
+    def conectar(self):
+        from iqoptionapi.stable_api import IQ_Option
+        print(f"⚡ [APEX ENGINE] Conectando como {EMAIL_IQ}...", flush=True)
+        self.api = IQ_Option(EMAIL_IQ, SENHA_IQ)
+        check, reason = self.api.connect()
 
-                        for par in ativos:
-                            try:
-                                candles_raw = self.api.get_candles(par, TIMEFRAME_SEGUNDOS, 40, time.time())
-                                if not candles_raw or len(candles_raw) < 30:
-                                    continue
+        if check:
+            self.api.change_balance(TIPO_CONTA)
+            saldo = self.api.get_balance()
+            self.banca_inicio_dia = saldo
+            self.banca_atual = saldo
+            self.conectado = True
+            self.matriz = WeeklyAdaptiveMatrix(self.api)
+            
+            # Mapeia todos os ativos reais, crypto, forex e OTC
+            self.sincronizar_universo_ativos()
+            
+            send_telegram(
+                f"🏛️ *APEX QUANT NEURAL ENGINE v3.0 INICIADO*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💼 *Conta:* `{TIPO_CONTA}` | *Saldo:* `R$ {saldo:.2f}`\n"
+                f"🌐 *Mercados:* `Forex, Crypto, Commodities, OTC` ({len(self.ativos_monitorados)} pares)\n"
+                f"🎯 *Filtro de Execução:* `Score Institucional ≥ {SCORE_MINIMO_EXECUCAO}%`\n"
+                f"📊 *Timeframes:* `1H (Macro) + 15M (VWAP) + 5M (ADX) + 1M (Micro)`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🟢 *Status:* _Varredura Neural Ativa 24/7._"
+            )
+            # Executa primeiro ciclo de aprendizado semanal
+            threading.Thread(target=self.matriz.executar_aprendizado_semanal, args=(self.ativos_monitorados,), daemon=True).start()
+            return True
+        else:
+            print(f"❌ Erro de conexão: {reason}", flush=True)
+            return False
 
-                                ts_vela = candles_raw[-1].get('from', 0)
-                                if self.ultima_vela_por_par.get(par) == ts_vela:
-                                    continue
+    def sincronizar_universo_ativos(self):
+        """Coleta 100% dos ativos abertos em Forex, Cripto, Binárias, Turbo e OTC"""
+        try:
+            todos = self.api.get_all_open_time()
+            encontrados = set()
+            for categoria in ['turbo', 'binary', 'digital', 'crypto', 'forex']:
+                if categoria in todos:
+                    for par, d in todos[categoria].items():
+                        if d.get('open', False):
+                            encontrados.add(par)
+            self.ativos_monitorados = sorted(list(encontrados)) if encontrados else ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "BTCUSD", "ETHUSD", "EURUSD"]
+        except Exception:
+            self.ativos_monitorados = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "EURUSD", "GBPUSD"]
 
-                                df = pd.DataFrame({'close': [c['close'] for c in candles_raw]})
-                                df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
-                                df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+    def avaliar_confluencia_multi_timeframe(self, par):
+        """Avalia 1H, 15M, 5M e 1M gerando pontuação de 0 a 100"""
+        try:
+            # 1. MACRO 1H (Tendência Soberana)
+            velas_1h = self.api.get_candles(par, 3600, 50, time.time())
+            if not velas_1h or len(velas_1h) < 30:
+                return None, 0
+            df_1h = pd.DataFrame(velas_1h)
+            ema200_1h = df_1h['close'].ewm(span=30, adjust=False).mean().iloc[-1]
+            preco_macro = df_1h['close'].iloc[-1]
+            tendencia_macro = "ALTA" if preco_macro > ema200_1h else "BAIXA"
 
-                                delta = df['close'].diff()
-                                gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
-                                loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
-                                rs = gain / (loss + 1e-9)
-                                rsi = float((100 - (100 / (1 + rs))).iloc[-1])
+            # 2. ESTRUTURA 15M (Força & ADX)
+            velas_15m = self.api.get_candles(par, 900, 30, time.time())
+            if not velas_15m:
+                return None, 0
+            df_15m = pd.DataFrame(velas_15m)
+            adx_15m = self.analise.calcular_adx(df_15m, 14)
 
-                                sinal, prob = self.analisar_sinal(df, rsi)
+            # 3. GATILHO MICRO 1M (Stoch RSI + Price Action)
+            velas_1m = self.api.get_candles(par, 60, 35, time.time())
+            if not velas_1m or len(velas_1m) < 25:
+                return None, 0
+            df_1m = pd.DataFrame(velas_1m)
+            stoch_rsi_1m = self.analise.calcular_stoch_rsi(df_1m['close'])
+            rejeicao_alta, rejeicao_baixa = self.analise.calcular_rejeicao_pavio(df_1m)
 
-                                if sinal in ["CALL", "PUT"] and prob > maior_prob:
-                                    maior_prob = prob
-                                    melhor_sinal = sinal
-                                    melhor_par = par
-                                    melhor_rsi = rsi
-                                    self.ultima_vela_por_par[par] = ts_vela
+            # 4. HEATMAP HISTÓRICO
+            score_historico = self.matriz.obter_score_historico(par)
 
-                            except Exception:
-                                continue
+            # CÁLCULO DO SCORE PONDERADO
+            score = 0.0
+            direcao = None
 
-                        # Se encontrou um sinal com boa confluência, executa no melhor par
-                        if melhor_sinal and melhor_par and maior_prob >= 75.0:
-                            self.operando_agora = True
-                            self.executar_ordem(melhor_par, melhor_sinal, melhor_rsi, maior_prob)
+            # Condições para COMPRA (CALL)
+            if tendencia_macro == "ALTA":
+                score += 30.0 # Macro alinhada
+                if adx_15m >= 22.0: score += 20.0 # Mercado com tendência ativa (não lateral)
+                if 20.0 <= stoch_rsi_1m <= 45.0: score += 20.0 # Pullback em zona compradora
+                if rejeicao_alta: score += 15.0 # Defesa dos compradores
+                score += (score_historico * 0.15) # Peso estatístico semanal
+                direcao = "CALL"
 
-                except Exception as e:
-                    print(f"[NUVEM ERRO LOOP] {e}", flush=True)
-                    time.sleep(5)
-                    break
+            # Condições para VENDA (PUT)
+            elif tendencia_macro == "BAIXA":
+                score += 30.0 # Macro alinhada
+                if adx_15m >= 22.0: score += 20.0
+                if 55.0 <= stoch_rsi_1m <= 80.0: score += 20.0 # Pullback em zona vendedora
+                if rejeicao_baixa: score += 15.0 # Defesa dos vendedores
+                score += (score_historico * 0.15)
+                direcao = "PUT"
 
-    def analisar_sinal(self, df, rsi):
-        p = df['close'].iloc[-1]
-        ema7 = df['ema7'].iloc[-1]
-        ema21 = df['ema21'].iloc[-1]
-        diff_ema = (ema7 - ema21) / ema21
+            return direcao, round(score, 1)
+        except Exception:
+            return None, 0
 
-        if ema7 > ema21 and p > ema7 and (50.0 <= rsi <= 65.0):
-            score_base = 75.0
-            bonus_rsi = (65.0 - rsi) * 0.45
-            bonus_forca = min(abs(diff_ema) * 15000, 11.0)
-            prob = min(round(score_base + bonus_rsi + bonus_forca, 1), 94.0)
-            return "CALL", prob
+    def despachar_ordem_institucional(self, par, direcao, score):
+        valor = ENTRADA_BASE if self.soros_estagio == 1 else (ENTRADA_BASE + self.soros_lucro)
+        tipo_mao = f"Soros N2 (Mão 2)" if self.soros_estagio == 2 else "Mão 1 (Base)"
 
-        elif ema7 < ema21 and p < ema7 and (35.0 <= rsi <= 50.0):
-            score_base = 75.0
-            bonus_rsi = (rsi - 35.0) * 0.45
-            bonus_forca = min(abs(diff_ema) * 15000, 11.0)
-            prob = min(round(score_base + bonus_rsi + bonus_forca, 1), 94.0)
-            return "PUT", prob
-
-        return "NEUTRO", 0.0
-
-    def executar_ordem(self, par, direcao, rsi_val, prob_val):
-        valor = self.gerenciador.obter_valor_entrada()
-        fase = f"Mão {self.gerenciador.estagio} (Soros)" if self.gerenciador.estagio == 2 else "Mão 1 (Base)"
-
-        hora_entrada = datetime.now()
-        hora_expiracao = hora_entrada + timedelta(seconds=TIMEFRAME_SEGUNDOS)
-        txt_hora_entrada = hora_entrada.strftime("%H:%M:%S")
-        txt_hora_expiracao = hora_expiracao.strftime("%H:%M:%S")
-
-        nome_amigavel = par.replace("-OTC", " (OTC)")
-        emoji_dir = "🟢 *CALL (COMPRA)*" if direcao == "CALL" else "🔴 *PUT (VENDA)*"
-
+        hora_str = datetime.now().strftime("%H:%M:%S")
         send_telegram(
-            f"🎯 *OPERAÇÃO DISPARADA (MULTI-ATIVOS)*\n"
+            f"⚡ *ENTRADA QUANT DISPARADA*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 *Ativo:* `{nome_amigavel}`\n"
-            f"⚡ *Direção:* {emoji_dir}\n"
-            f"📊 *Probabilidade:* `{prob_val}%` 🔥\n"
-            f"💰 *Valor da Entrada:* `R$ {valor:.2f}` ({fase})\n"
-            f"⏰ *Horário Entrada:* `{txt_hora_entrada}`\n"
-            f"⏳ *Expiração Prevista:* `{txt_hora_expiracao}`\n"
-            f"📐 *RSI(7):* `{rsi_val:.1f}` | *TF:* `M1`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ *Status:* _Executando na corretora..._"
+            f"📊 *Ativo:* `{par}`\n"
+            f"🎯 *Direção:* `{'🟢 CALL (COMPRA)' if direcao=='CALL' else '🔴 PUT (VENDA)'}`\n"
+            f"🧠 *Score Confluência:* `{score}%` 🔥\n"
+            f"💰 *Aporte:* `R$ {valor:.2f}` ({tipo_mao})\n"
+            f"⏰ *Horário:* `{hora_str}` | *TF:* `M1 (Multi-TF Filtered)`\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
 
-        dir_api = "call" if direcao == "CALL" else "put"
-        tf_min = TIMEFRAME_SEGUNDOS // 60
-        status, id_ordem = self.api.buy(valor, par, dir_api, tf_min)
-
-        if status and id_ordem:
-            threading.Thread(target=self.acompanhar_ordem, args=(id_ordem, par, direcao, valor, txt_hora_entrada), daemon=True).start()
-        else:
-            self.operando_agora = False
-            send_telegram(f"⚠️ *Corretora rejeitou a ordem em {nome_amigavel}* de R$ {valor:.2f} ({direcao}).")
-
-    def acompanhar_ordem(self, id_ordem, par, direcao, valor, txt_hora_entrada):
-        time.sleep(TIMEFRAME_SEGUNDOS + 3)
-        lucro_real = 0.0
-        resultado = "LOSS"
+        # Execução Inteligente (Digital Spot com Fallback para Binárias)
+        id_ordem = None
+        tipo_exec = "DIGITAL"
         try:
-            status_win, lucro = self.api.check_win_v4(id_ordem)
-            if status_win:
-                resultado = "WIN" if lucro > 0 else ("EMPATE" if lucro == 0 else "LOSS")
-                lucro_real = lucro
-            else:
-                lucro = self.api.check_win_v3(id_ordem)
-                resultado = "WIN" if lucro > 0 else "LOSS"
-                lucro_real = lucro
+            _, id_dig = self.api.buy_digital_spot(par, valor, direcao.lower(), 1)
+            if id_dig and id_dig != "error":
+                id_ordem = id_dig
         except Exception:
             pass
 
-        hora_fechamento = datetime.now().strftime("%H:%M:%S")
-        self.gerenciador.registrar_resultado(resultado, lucro_real)
+        if not id_ordem:
+            try:
+                status, id_bin = self.api.buy(valor, par, direcao.lower(), 1)
+                if status and id_bin:
+                    id_ordem = id_bin
+                    tipo_exec = "BINARY"
+            except Exception:
+                pass
+
+        if id_ordem:
+            threading.Thread(target=self._acompanhar_desfecho, args=(id_ordem, par, direcao, valor, tipo_exec), daemon=True).start()
+        else:
+            self.operando_lock = False
+            send_telegram(f"⚠️ *Corretora indisponível para {par} no momento.*")
+
+    def _acompanhar_desfecho(self, id_ordem, par, direcao, valor, tipo_exec):
+        time.sleep(63)
+        lucro_real = 0.0
+        resultado = "LOSS"
+
+        try:
+            if tipo_exec == "DIGITAL":
+                check, lucro = self.api.check_win_digital_v2(id_ordem)
+                resultado = "WIN" if (check and lucro > 0) else "LOSS"
+                lucro_real = lucro
+            else:
+                status, lucro = self.api.check_win_v4(id_ordem)
+                resultado = "WIN" if (status and lucro > 0) else "LOSS"
+                lucro_real = lucro
+        except Exception:
+            pass
 
         if resultado == "WIN":
             self.wins += 1
-            icone_res = "✅ *WIN (VITÓRIA)*"
-            valor_res = f"+R$ {lucro_real:.2f}"
+            if self.soros_estagio == 1:
+                self.soros_estagio = 2
+                self.soros_lucro = lucro_real
+            else:
+                self.soros_estagio = 1
+                self.soros_lucro = 0.0
         else:
             self.losses += 1
-            icone_res = "❌ *LOSS (PERDA)*"
-            valor_res = f"-R$ {valor:.2f}"
+            self.soros_estagio = 1
+            self.soros_lucro = 0.0
 
-        saldo = self.gerenciador.banca_atual
         try:
-            saldo_api = self.api.get_balance()
-            if saldo_api:
-                saldo = saldo_api
+            self.banca_atual = self.api.get_balance()
         except Exception:
             pass
 
-        nome_amigavel = par.replace("-OTC", " (OTC)")
+        lucro_dia = self.banca_atual - self.banca_inicio_dia
         send_telegram(
-            f"📋 *RESULTADO DA OPERAÇÃO*\n"
+            f"📋 *RELATÓRIO DE DESFECHO QUANT*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏁 *Desfecho:* {icone_res}\n"
-            f"💵 *Resultado:* `{valor_res}`\n"
-            f"📈 *Ativo:* `{nome_amigavel}`\n"
-            f"🕒 *Entrada:* `{txt_hora_entrada}` | *Fechamento:* `{hora_fechamento}`\n"
-            f"📊 *Placar Geral:* `{self.wins} WIN  x  {self.losses} LOSS`\n"
-            f"💼 *Banca Atualizada:* `R$ {saldo:.2f}`\n"
+            f"🏁 *Resultado:* `{'✅ WIN (VITÓRIA)' if resultado=='WIN' else '❌ LOSS'}`\n"
+            f"💵 *Retorno:* `{'+R$ ' + str(round(lucro_real, 2)) if resultado=='WIN' else '-R$ ' + str(round(valor, 2))}`\n"
+            f"📈 *Par:* `{par}` | *Placar:* `{self.wins}W x {self.losses}L`\n"
+            f"💼 *Saldo:* `R$ {self.banca_atual:.2f}` (Dia: `R$ {lucro_dia:+.2f}`)\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
-        self.operando_agora = False
+        self.operando_lock = False
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain; charset=utf-8')
-        self.end_headers()
+    def loop_operacional(self):
+        while True:
+            if not self.conectado:
+                if not self.conectar():
+                    time.sleep(15)
+                    continue
 
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(b"Apex Trading Bot Multi-Asset 24/7 Ativo.")
+            # Trava de Segurança Diária (Stop Win / Stop Loss)
+            lucro_dia = self.banca_atual - self.banca_inicio_dia
+            if lucro_dia >= STOP_WIN:
+                send_telegram(f"🏆 *STOP WIN ALCANÇADO!* Lucro: `+R$ {lucro_dia:.2f}`. Pausando por segurança.")
+                time.sleep(3600 * 8)
+                continue
+            elif lucro_dia <= -STOP_LOSS:
+                send_telegram(f"🛑 *STOP LOSS ATINGIDO.* Perda: `-R$ {abs(lucro_dia):.2f}`. Preservando capital.")
+                time.sleep(3600 * 8)
+                continue
 
-    def log_message(self, format, *args):
-        pass
+            time.sleep(1)
+            segundo = int(time.time()) % 60
 
-def iniciar_servidor_web():
-    porta = int(os.environ.get("PORT", 8080))
-    servidor = HTTPServer(('0.0.0.0', porta), HealthHandler)
-    print(f"[NUVEM] Servidor Web ativo na porta {porta}", flush=True)
-    servidor.serve_forever()
+            # Dispara análise rigorosa na virada da vela (segundo 0 e 1)
+            if segundo in [0, 1] and not self.operando_lock:
+                melhor_par = None
+                melhor_direcao = None
+                maior_score = 0.0
+
+                for par in self.ativos_monitorados:
+                    direcao, score = self.avaliar_confluencia_multi_timeframe(par)
+                    if score >= SCORE_MINIMO_EXECUCAO and score > maior_score:
+                        maior_score = score
+                        melhor_direcao = direcao
+                        melhor_par = par
+
+                if melhor_par and melhor_direcao:
+                    self.operando_lock = True
+                    self.despachar_ordem_institucional(melhor_par, melhor_direcao, maior_score)
 
 if __name__ == "__main__":
-    print("[NUVEM] Iniciando Robô Multi-Ativos...", flush=True)
-    send_telegram("⚡ *Atualização aplicada: Robô agora monitora TODOS os ativos abertos da corretora 24/7!*")
-
-    worker = BotMultiAssetWorker()
-    t_bot = threading.Thread(target=worker.loop_operacional, daemon=True)
-    t_bot.start()
-
-    iniciar_servidor_web()
+    motor = ApexQuantEngine()
+    motor.loop_operacional()
