@@ -1,5 +1,4 @@
 requests
 pandas
 numpy
-websocket-client==0.56.0
-https://github.com/Lu-Yi-Hsun/iqoptionapi/archive/refs/heads/master.zip
+iqoptionapi-v2
