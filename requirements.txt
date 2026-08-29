@@ -1,4 +1,6 @@
+
 requests
 pandas
 numpy
-iqoptionapi-v2
+websocket-client
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
