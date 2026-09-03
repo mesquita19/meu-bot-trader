@@ -9,70 +9,70 @@ import pandas as pd
 import numpy as np
 import requests
 
-# ================= ESTADO GLOBAL DO TERMINAL =================
-ESTADO_TERMINAL = {
+# ================= ESTADO GLOBAL COMPARTILHADO =================
+ESTADO = {
     "status": "Iniciando...",
     "robo_ativo": True,
     "email": os.environ.get("IQ_EMAIL", "ceatecnology@gmail.com").strip(),
     "tipo_conta": os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper(),
-    "saldo_inicial": 0.0,
     "saldo_atual": 0.0,
+    "saldo_inicial": 0.0,
     "lucro_dia": 0.0,
     "placar_w": 0,
     "placar_l": 0,
     "soros_estagio": 1,
-    "ativo_selecionado": "EURUSD-OTC",
-    "ativos_disponiveis": ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "BTCUSD", "ETHUSD", "EURUSD"],
-    "score_atual": 0.0,
-    "velas_grafico": [],
-    "historico_operacoes": [],
-    "indicadores": {"ema200": 0.0, "adx": 0.0, "stoch": 50.0, "tendencia": "NEUTRO"}
+    "ativo": "EURUSD-OTC",
+    "preco_atual": 0.0,
+    "score": 0.0,
+    "tendencia": "NEUTRO",
+    "adx": 0.0,
+    "historico": []
 }
 
-API_IQ_GLOBAL = None
-LOCK_OPERACIONAL = threading.Lock()
+API_GLOBAL = None
+LOCK_API = threading.Lock()
 
-# ================= SERVIDOR HTTP & API REST =================
-class ProfessionalTerminalHandler(BaseHTTPRequestHandler):
+# ================= SERVIDOR WEB RESPONSIVO =================
+class MobileTerminalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/api/terminal-data':
+        if self.path == '/api/dados':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps(ESTADO_TERMINAL).encode('utf-8'))
+            self.wfile.write(json.dumps(ESTADO).encode('utf-8'))
             return
 
-        if self.path.startswith('/api/candles'):
-            # Formato: /api/candles?par=EURUSD-OTC
-            par = ESTADO_TERMINAL["ativo_selecionado"]
+        if self.path.startswith('/api/velas'):
+            par = ESTADO["ativo"]
             if 'par=' in self.path:
                 par = self.path.split('par=')[1].split('&')[0]
-                ESTADO_TERMINAL["ativo_selecionado"] = par
-            
-            velas_formatadas = []
-            if API_IQ_GLOBAL:
+                ESTADO["ativo"] = par
+
+            velas_limpas = []
+            if API_GLOBAL:
                 try:
-                    velas = API_IQ_GLOBAL.get_candles(par, 60, 60, time.time())
-                    if velas:
-                        for v in velas:
-                            velas_formatadas.append({
-                                "time": v["from"],
+                    raw = API_GLOBAL.get_candles(par, 60, 60, time.time())
+                    if raw:
+                        df = pd.DataFrame(raw).drop_duplicates(subset=['from']).sort_values('from')
+                        for _, v in df.iterrows():
+                            velas_limpas.append({
+                                "time": int(v["from"]),
                                 "open": float(v["open"]),
                                 "high": float(v["max"]),
                                 "low": float(v["min"]),
-                                "close": float(v["close"]),
-                                "volume": float(v.get("volume", 0))
+                                "close": float(v["close"])
                             })
-                        ESTADO_TERMINAL["velas_grafico"] = velas_formatadas
-                except Exception:
-                    pass
+                        if velas_limpas:
+                            ESTADO["preco_atual"] = velas_limpas[-1]["close"]
+                except Exception as e:
+                    print(f"Erro ao buscar velas: {e}", flush=True)
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps(velas_formatadas).encode('utf-8'))
+            self.wfile.write(json.dumps(velas_limpas).encode('utf-8'))
             return
 
         self.send_response(200)
@@ -84,260 +84,194 @@ class ProfessionalTerminalHandler(BaseHTTPRequestHandler):
         <html lang="pt-BR">
         <head>
             <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Apex Quant Terminal Pro | Live Candlesticks</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <title>Apex Trader Pro</title>
             <script src="https://cdn.tailwindcss.com"></script>
             <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
-            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
             <style>
-                body { background: #07090e; color: #cbd5e1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-                .glass-panel { background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
-                .glow-call { box-shadow: 0 0 20px rgba(16, 185, 129, 0.4); }
-                .glow-put { box-shadow: 0 0 20px rgba(244, 63, 94, 0.4); }
+                body { background-color: #080c14; color: #cbd5e1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+                .card { background: #0f172a; border: 1px solid #1e293b; }
             </style>
         </head>
-        <body class="h-screen flex flex-col overflow-hidden">
-            <!-- Top Navigation Bar -->
-            <header class="h-14 border-b border-slate-800 bg-slate-950/80 flex items-center justify-between px-4 z-20">
-                <div class="flex items-center gap-4">
-                    <div class="flex items-center gap-2">
-                        <div class="w-3 h-3 rounded-full bg-emerald-500 animate-ping"></div>
-                        <span class="font-black text-lg text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">APEX PRO MATRIX</span>
-                    </div>
-                    <div class="h-5 w-px bg-slate-800"></div>
-                    <select id="select-par" onchange="trocarPar()" class="bg-slate-900 border border-slate-700 text-white font-bold rounded-lg px-3 py-1.5 text-xs focus:ring-2 focus:ring-cyan-500 outline-none">
+        <body class="flex flex-col min-h-screen p-2 sm:p-4 space-y-3">
+            <!-- Header Superior -->
+            <header class="card p-3 rounded-xl flex items-center justify-between">
+                <div class="flex items-center space-x-2">
+                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <span class="font-black text-sm text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">APEX PRO</span>
+                    <select id="par-select" onchange="mudarAtivo()" class="bg-slate-900 border border-slate-700 text-xs font-bold rounded px-2 py-1 text-white">
                         <option value="EURUSD-OTC">EUR/USD (OTC)</option>
                         <option value="GBPUSD-OTC">GBP/USD (OTC)</option>
                         <option value="USDJPY-OTC">USD/JPY (OTC)</option>
-                        <option value="BTCUSD">BTC/USD (Cripto)</option>
-                        <option value="EURUSD">EUR/USD (Forex)</option>
+                        <option value="EURUSD">EUR/USD</option>
+                        <option value="BTCUSD">BTC/USD</option>
                     </select>
                 </div>
-
-                <div class="flex items-center gap-6">
-                    <div class="hidden md:flex items-center gap-4 text-xs font-mono">
-                        <div><span class="text-slate-500">TENDÊNCIA 1H:</span> <span id="val-tendencia" class="text-emerald-400 font-bold">ALTA</span></div>
-                        <div><span class="text-slate-500">ADX 15M:</span> <span id="val-adx" class="text-cyan-400 font-bold">28.4</span></div>
-                        <div><span class="text-slate-500">CONFLUÊNCIA:</span> <span id="val-score" class="text-amber-400 font-bold">88.5%</span></div>
-                    </div>
-                    <div class="h-5 w-px bg-slate-800 hidden md:block"></div>
-                    <div class="text-right">
-                        <span class="text-[10px] text-slate-500 font-mono tracking-wider block uppercase" id="badge-tipo-conta">PRACTICE ACCOUNT</span>
-                        <span class="text-lg font-black text-white font-mono" id="txt-saldo">R$ 0,00</span>
-                    </div>
+                <div class="text-right font-mono">
+                    <div class="text-[10px] text-slate-400" id="tipo-conta">PRACTICE</div>
+                    <div class="text-sm font-bold text-white" id="val-saldo">R$ 0,00</div>
                 </div>
             </header>
 
-            <!-- Main Workspace -->
-            <div class="flex-1 flex overflow-hidden">
-                <!-- Left: Interactive Candlestick Chart -->
-                <div class="flex-1 flex flex-col relative bg-[#07090e]">
-                    <!-- Chart Tools Overlay -->
-                    <div class="absolute top-3 left-3 z-10 flex gap-2">
-                        <span class="px-2 py-1 bg-slate-900/90 border border-slate-700 rounded text-[11px] font-mono text-cyan-400">1M (Micro)</span>
-                        <span class="px-2 py-1 bg-slate-900/90 border border-slate-700 rounded text-[11px] font-mono text-slate-300" id="live-price">Preço: ---</span>
-                    </div>
-                    
-                    <!-- Candlestick Canvas Container -->
-                    <div id="chart-container" class="flex-1 w-full h-full"></div>
-
-                    <!-- Bottom Live Order History -->
-                    <div class="h-44 border-t border-slate-800 bg-slate-950/70 p-3 overflow-y-auto">
-                        <div class="flex justify-between items-center mb-2">
-                            <span class="text-xs font-bold uppercase tracking-wider text-slate-400">Ordens Executadas em Tempo Real</span>
-                            <span class="text-xs font-mono text-slate-400" id="txt-placar">Placar: 0W x 0L</span>
-                        </div>
-                        <table class="w-full text-left text-xs font-mono">
-                            <thead class="text-slate-600 border-b border-slate-800/80 pb-1">
-                                <tr>
-                                    <th>HORA</th>
-                                    <th>PAR</th>
-                                    <th>TIPO</th>
-                                    <th>SCORE</th>
-                                    <th>VALOR</th>
-                                    <th>RESULTADO</th>
-                                </tr>
-                            </thead>
-                            <tbody id="lista-operacoes" class="divide-y divide-slate-900/60">
-                                <tr>
-                                    <td colspan="6" class="py-3 text-center text-slate-600">Nenhuma ordem disparada no ciclo atual.</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
+            <!-- Preço e Métricas Rápidas -->
+            <div class="grid grid-cols-3 gap-2 text-center text-xs font-mono">
+                <div class="card p-2 rounded-lg">
+                    <div class="text-[10px] text-slate-400">PREÇO ATUAL</div>
+                    <div class="font-bold text-cyan-400 mt-0.5" id="val-preco">---</div>
                 </div>
-
-                <!-- Right: Trading Console & Automation Controls -->
-                <div class="w-80 border-l border-slate-800 bg-slate-950/90 p-4 flex flex-col justify-between overflow-y-auto z-10">
-                    <div class="space-y-4">
-                        <!-- Switch Automação -->
-                        <div class="glass-panel p-3 rounded-xl flex items-center justify-between">
-                            <div>
-                                <div class="text-xs font-bold text-white">AUTOMAÇÃO NEURAL</div>
-                                <div class="text-[10px] text-slate-400">Varredura Institucional 24/7</div>
-                            </div>
-                            <button id="btn-toggle-robo" onclick="toggleRobo()" class="px-3 py-1 bg-emerald-500 hover:bg-emerald-600 text-black text-xs font-black rounded-lg transition-all">LIGADO</button>
-                        </div>
-
-                        <!-- Painel Manual de Execução Instantânea -->
-                        <div class="glass-panel p-4 rounded-xl space-y-3">
-                            <div class="text-xs font-bold tracking-wider text-slate-300 uppercase">Execução Manual Imediata</div>
-                            
-                            <div>
-                                <label class="text-[10px] text-slate-400 uppercase font-semibold">Valor da Entrada (R$)</label>
-                                <input type="number" id="input-valor" value="20" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-sm text-white font-mono mt-1 focus:ring-2 focus:ring-cyan-500 outline-none">
-                            </div>
-
-                            <div>
-                                <label class="text-[10px] text-slate-400 uppercase font-semibold">Expiração</label>
-                                <select id="input-exp" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs text-white font-mono mt-1 outline-none">
-                                    <option value="1">1 Minuto (M1 Turbo)</option>
-                                    <option value="5">5 Minutos (M5)</option>
-                                </select>
-                            </div>
-
-                            <!-- Botões de Compra e Venda Clicáveis -->
-                            <div class="grid grid-cols-2 gap-3 pt-2">
-                                <button onclick="executarOrdemManual('CALL')" class="h-16 rounded-xl bg-gradient-to-t from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white font-black text-sm flex flex-col items-center justify-center gap-1 glow-call transition-transform active:scale-95">
-                                    <i class="fa-solid fa-arrow-trend-up text-lg"></i>
-                                    <span>COMPRA (CALL)</span>
-                                </button>
-                                <button onclick="executarOrdemManual('PUT')" class="h-16 rounded-xl bg-gradient-to-t from-rose-600 to-rose-500 hover:from-rose-500 hover:to-rose-400 text-white font-black text-sm flex flex-col items-center justify-center gap-1 glow-put transition-transform active:scale-95">
-                                    <i class="fa-solid fa-arrow-trend-down text-lg"></i>
-                                    <span>VENDA (PUT)</span>
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Card de Gestão e Lucro -->
-                        <div class="glass-panel p-3 rounded-xl space-y-2 text-xs">
-                            <div class="flex justify-between">
-                                <span class="text-slate-400">Lucro do Dia:</span>
-                                <span id="txt-lucro" class="font-bold text-emerald-400 font-mono">+R$ 0,00</span>
-                            </div>
-                            <div class="flex justify-between">
-                                <span class="text-slate-400">Soros Nível:</span>
-                                <span id="txt-soros" class="font-bold text-cyan-400 font-mono">Mão 1 (R$ 20.00)</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="text-center pt-4 border-t border-slate-900 text-[10px] text-slate-600">
-                        Apex Quant Engine v3.0 • Host Conectado
-                    </div>
+                <div class="card p-2 rounded-lg">
+                    <div class="text-[10px] text-slate-400">CONFLUÊNCIA</div>
+                    <div class="font-bold text-amber-400 mt-0.5" id="val-score">0.0%</div>
+                </div>
+                <div class="card p-2 rounded-lg">
+                    <div class="text-[10px] text-slate-400">LUCRO DO DIA</div>
+                    <div class="font-bold text-emerald-400 mt-0.5" id="val-lucro">R$ 0,00</div>
                 </div>
             </div>
 
-            <!-- JavaScript do Gráfico Interativo e Sincronização -->
+            <!-- Gráfico de Velas Japonesas -->
+            <div class="card rounded-xl p-1 relative flex-1 flex flex-col" style="min-height: 280px; height: 42vh;">
+                <div id="chart-area" class="w-full h-full"></div>
+            </div>
+
+            <!-- Controles Manuais e Botões Grandes de Ação -->
+            <div class="card p-3 rounded-xl space-y-3">
+                <div class="flex items-center justify-between gap-2 text-xs font-mono">
+                    <div class="flex-1">
+                        <label class="text-[10px] text-slate-400 block mb-1">VALOR (R$)</label>
+                        <input type="number" id="input-valor" value="20" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white font-bold outline-none text-center">
+                    </div>
+                    <div class="flex-1">
+                        <label class="text-[10px] text-slate-400 block mb-1">EXPIRAÇÃO</label>
+                        <select id="input-exp" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white font-bold outline-none text-center">
+                            <option value="1">1 Minuto</option>
+                            <option value="5">5 Minutos</option>
+                        </select>
+                    </div>
+                    <div class="flex-1">
+                        <label class="text-[10px] text-slate-400 block mb-1">ROBÔ AUTO</label>
+                        <button id="btn-auto" onclick="toggleRobo()" class="w-full bg-emerald-500 text-black font-black p-2 rounded-lg text-xs">LIGADO</button>
+                    </div>
+                </div>
+
+                <!-- Botões de Compra e Venda -->
+                <div class="grid grid-cols-2 gap-3 pt-1">
+                    <button onclick="dispararOrdem('CALL')" class="h-14 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-black text-sm flex items-center justify-center space-x-2 transition-all shadow-lg shadow-emerald-900/30">
+                        <span>▲</span>
+                        <span>COMPRA (CALL)</span>
+                    </button>
+                    <button onclick="dispararOrdem('PUT')" class="h-14 rounded-xl bg-rose-600 hover:bg-rose-500 active:scale-95 text-white font-black text-sm flex items-center justify-center space-x-2 transition-all shadow-lg shadow-rose-900/30">
+                        <span>▼</span>
+                        <span>VENDA (PUT)</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Histórico Recente -->
+            <div class="card p-3 rounded-xl space-y-2">
+                <div class="flex justify-between items-center text-xs border-b border-slate-800 pb-1">
+                    <span class="font-bold text-slate-300">ÚLTIMAS EXECUÇÕES</span>
+                    <span class="font-mono text-slate-400" id="val-placar">0W - 0L</span>
+                </div>
+                <div id="historico-container" class="space-y-1 text-xs font-mono max-h-24 overflow-y-auto">
+                    <div class="text-slate-500 text-center py-2">Nenhuma operação disparada ainda.</div>
+                </div>
+            </div>
+
             <script>
-                // 1. Inicializa o gráfico de velas profissionais estilo TradingView
-                const chartContainer = document.getElementById('chart-container');
-                const chart = LightweightCharts.createChart(chartContainer, {
-                    layout: { background: { color: '#07090e' }, textColor: '#94a3b8' },
-                    grid: { vertLines: { color: '#0f172a' }, horzLines: { color: '#0f172a' } },
+                const container = document.getElementById('chart-area');
+                const chart = LightweightCharts.createChart(container, {
+                    layout: { background: { color: '#0f172a' }, textColor: '#64748b' },
+                    grid: { vertLines: { color: '#1e293b' }, horzLines: { color: '#1e293b' } },
+                    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
                     timeScale: { timeVisible: true, secondsVisible: true, borderColor: '#1e293b' },
                     rightPriceScale: { borderColor: '#1e293b' }
                 });
 
-                const candleSeries = chart.addCandlestickSeries({
-                    upColor: '#10b981', downColor: '#f43f5e', borderUpColor: '#10b981',
-                    borderDownColor: '#f43f5e', wickUpColor: '#10b981', wickDownColor: '#f43f5e'
+                const candles = chart.addCandlestickSeries({
+                    upColor: '#10b981', downColor: '#f43f5e',
+                    borderUpColor: '#10b981', borderDownColor: '#f43f5e',
+                    wickUpColor: '#10b981', wickDownColor: '#f43f5e'
                 });
 
-                window.addEventListener('resize', () => {
-                    chart.resize(chartContainer.clientWidth, chartContainer.clientHeight);
-                });
+                function ajustarGrafico() {
+                    chart.resize(container.clientWidth, container.clientHeight);
+                }
+                window.addEventListener('resize', ajustarGrafico);
+                setTimeout(ajustarGrafico, 300);
 
-                async function sincronizarVelas() {
+                async function puxarVelas() {
                     try {
-                        const par = document.getElementById('select-par').value;
-                        const res = await fetch('/api/candles?par=' + par);
-                        const dadosVelas = await res.json();
-                        if (dadosVelas && dadosVelas.length > 0) {
-                            candleSeries.setData(dadosVelas);
-                            const ultima = dadosVelas[dadosVelas.length - 1];
-                            document.getElementById('live-price').innerText = 'Preço: ' + ultima.close.toFixed(5);
+                        const par = document.getElementById('par-select').value;
+                        const res = await fetch('/api/velas?par=' + par);
+                        const dados = await res.json();
+                        if (dados && dados.length > 0) {
+                            candles.setData(dados);
+                            const ult = dados[dados.length - 1];
+                            document.getElementById('val-preco').innerText = ult.close.toFixed(5);
                         }
                     } catch (e) {
-                        console.error("Erro ao carregar velas:", e);
+                        console.error("Erro nas velas:", e);
                     }
                 }
 
-                async function atualizarDadosGerais() {
+                async function puxarDados() {
                     try {
-                        const res = await fetch('/api/terminal-data');
+                        const res = await fetch('/api/dados');
                         const data = await res.json();
+                        document.getElementById('val-saldo').innerText = 'R$ ' + data.saldo_atual.toFixed(2);
+                        document.getElementById('tipo-conta').innerText = data.tipo_conta;
+                        document.getElementById('val-score').innerText = data.score.toFixed(1) + '%';
+                        document.getElementById('val-placar').innerText = `${data.placar_w}W - ${data.placar_l}L`;
 
-                        document.getElementById('txt-saldo').innerText = 'R$ ' + data.saldo_atual.toFixed(2);
-                        document.getElementById('badge-tipo-conta').innerText = data.tipo_conta + ' ACCOUNT';
-                        
-                        const lucroEl = document.getElementById('txt-lucro');
+                        const lucroEl = document.getElementById('val-lucro');
                         lucroEl.innerText = (data.lucro_dia >= 0 ? '+R$ ' : '-R$ ') + Math.abs(data.lucro_dia).toFixed(2);
-                        lucroEl.className = 'font-bold font-mono ' + (data.lucro_dia >= 0 ? 'text-emerald-400' : 'text-rose-400');
+                        lucroEl.className = 'font-bold mt-0.5 ' + (data.lucro_dia >= 0 ? 'text-emerald-400' : 'text-rose-400');
 
-                        document.getElementById('txt-placar').innerText = `Placar: ${data.placar_w}W x ${data.placar_l}L`;
-                        document.getElementById('val-tendencia').innerText = data.indicadores.tendencia;
-                        document.getElementById('val-adx').innerText = data.indicadores.adx.toFixed(1);
-                        document.getElementById('val-score').innerText = data.score_atual.toFixed(1) + '%';
-                        document.getElementById('txt-soros').innerText = `Nível ${data.soros_estagio}`;
-
-                        if (data.historico_operacoes && data.historico_operacoes.length > 0) {
-                            const tbody = document.getElementById('lista-operacoes');
-                            tbody.innerHTML = data.historico_operacoes.map(op => `
-                                <tr>
-                                    <td class="py-1 text-slate-500">${op.hora}</td>
-                                    <td class="font-bold text-white">${op.par}</td>
-                                    <td><span class="font-bold ${op.direcao === 'CALL' ? 'text-emerald-400' : 'text-rose-400'}">${op.direcao}</span></td>
-                                    <td class="text-cyan-400">${op.score}%</td>
-                                    <td>R$ ${op.valor.toFixed(2)}</td>
-                                    <td class="font-bold ${op.resultado === 'WIN' ? 'text-emerald-400' : 'text-rose-400'}">${op.resultado}</td>
-                                </tr>
+                        if (data.historico.length > 0) {
+                            document.getElementById('historico-container').innerHTML = data.historico.map(h => `
+                                <div class="flex justify-between p-1 bg-slate-900 rounded">
+                                    <span>${h.hora} ${h.par}</span>
+                                    <span class="${h.direcao === 'CALL' ? 'text-emerald-400' : 'text-rose-400'} font-bold">${h.direcao}</span>
+                                    <span class="${h.resultado === 'WIN' ? 'text-emerald-400' : 'text-rose-400'} font-bold">${h.resultado}</span>
+                                </div>
                             `).join('');
                         }
-                    } catch (e) {
-                        console.error("Erro ao sincronizar terminal:", e);
+                    } catch (e) {}
+                }
+
+                function mudarAtivo() {
+                    puxarVelas();
+                }
+
+                async function toggleRobo() {
+                    const btn = document.getElementById('btn-auto');
+                    const resp = await fetch('/api/toggle', { method: 'POST' });
+                    const res = await resp.json();
+                    if (res.ativo) {
+                        btn.innerText = 'LIGADO';
+                        btn.className = 'w-full bg-emerald-500 text-black font-black p-2 rounded-lg text-xs';
+                    } else {
+                        btn.innerText = 'PAUSADO';
+                        btn.className = 'w-full bg-amber-500 text-black font-black p-2 rounded-lg text-xs';
                     }
                 }
 
-                async function executarOrdemManual(direcao) {
-                    const par = document.getElementById('select-par').value;
+                async function dispararOrdem(direcao) {
+                    const par = document.getElementById('par-select').value;
                     const valor = parseFloat(document.getElementById('input-valor').value);
                     const exp = parseInt(document.getElementById('input-exp').value);
-
-                    try {
-                        const res = await fetch('/api/ordem-manual', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ par, direcao, valor, exp })
-                        });
-                        const resultado = await res.json();
-                        alert(`Ordem de ${direcao} enviada para ${par} com sucesso!`);
-                    } catch (e) {
-                        alert("Ordem enviada ao processador.");
-                    }
+                    await fetch('/api/executar', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ par, direcao, valor, exp })
+                    });
                 }
 
-                function trocarPar() {
-                    sincronizarVelas();
-                }
-
-                function toggleRobo() {
-                    const btn = document.getElementById('btn-toggle-robo');
-                    if (btn.innerText === 'LIGADO') {
-                        btn.innerText = 'PAUSADO';
-                        btn.className = 'px-3 py-1 bg-amber-500 hover:bg-amber-600 text-black text-xs font-black rounded-lg transition-all';
-                    } else {
-                        btn.innerText = 'LIGADO';
-                        btn.className = 'px-3 py-1 bg-emerald-500 hover:bg-emerald-600 text-black text-xs font-black rounded-lg transition-all';
-                    }
-                    fetch('/api/toggle-robo', { method: 'POST' });
-                }
-
-                // Sincronizações periódicas
-                setInterval(sincronizarVelas, 2500);
-                setInterval(atualizarDadosGerais, 3000);
-                sincronizarVelas();
-                atualizarDadosGerais();
+                setInterval(puxarVelas, 2000);
+                setInterval(puxarDados, 3000);
+                puxarVelas();
+                puxarDados();
             </script>
         </body>
         </html>
@@ -346,180 +280,138 @@ class ProfessionalTerminalHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length).decode('utf-8')
+        dados = self.rfile.read(content_length).decode('utf-8')
 
-        if self.path == '/api/toggle-robo':
-            ESTADO_TERMINAL["robo_ativo"] = not ESTADO_TERMINAL["robo_ativo"]
+        if self.path == '/api/toggle':
+            ESTADO["robo_ativo"] = not ESTADO["robo_ativo"]
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "robo_ativo": ESTADO_TERMINAL["robo_ativo"]}).encode('utf-8'))
+            self.wfile.write(json.dumps({"ativo": ESTADO["robo_ativo"]}).encode('utf-8'))
             return
 
-        if self.path == '/api/ordem-manual':
-            try:
-                params = json.loads(post_data)
-                par = params.get("par", "EURUSD-OTC")
-                direcao = params.get("direcao", "CALL")
-                valor = float(params.get("valor", 20))
-                exp = int(params.get("exp", 1))
-
-                threading.Thread(target=despachar_ordem_iq, args=(par, direcao, valor, exp, 99.0, "MANUAL"), daemon=True).start()
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ordem_enviada"}).encode('utf-8'))
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
+        if self.path == '/api/executar':
+            corpo = json.loads(dados)
+            threading.Thread(target=enviar_ordem, args=(corpo.get("par"), corpo.get("direcao"), float(corpo.get("valor", 20)), int(corpo.get("exp", 1))), daemon=True).start()
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "enviado"}).encode('utf-8'))
             return
 
     def log_message(self, format, *args):
         return
 
-def iniciar_servidor_http():
+def iniciar_servidor():
     porta = int(os.environ.get("PORT", 10000))
-    servidor = HTTPServer(('0.0.0.0', porta), ProfessionalTerminalHandler)
-    print(f"🌐 [TERMINAL PRO] Dashboard Visual ativo na porta {porta}!", flush=True)
-    servidor.serve_forever()
+    httpd = HTTPServer(('0.0.0.0', porta), MobileTerminalHandler)
+    httpd.serve_forever()
 
-threading.Thread(target=iniciar_servidor_http, daemon=True).start()
-# ===============================================================
+threading.Thread(target=iniciar_servidor, daemon=True).start()
 
-# ================= CONFIGURAÇÕES & DISPARADOR =================
+# ================= EXECUÇÃO E MOTOR =================
 TG_TOKEN = os.environ.get("TG_TOKEN", "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "999294230").strip()
 
-EMAIL_IQ = os.environ.get("IQ_EMAIL", "ceatecnology@gmail.com").strip()
-SENHA_IQ = os.environ.get("IQ_PASSWORD", "").strip()
-TIPO_CONTA = os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper()
-
-SCORE_MINIMO_EXECUCAO = 85.0
-ENTRADA_BASE = 20.0
-
-def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    def _post():
+def notificar_telegram(texto):
+    if TG_TOKEN and TG_CHAT_ID:
         try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=8)
-        except Exception: pass
-    threading.Thread(target=_post, daemon=True).start()
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": texto, "parse_mode": "Markdown"}, timeout=5)
+        except Exception:
+            pass
 
-def despachar_ordem_iq(par, direcao, valor, exp, score, origem="AUTO"):
-    global API_IQ_GLOBAL
-    if not API_IQ_GLOBAL: return
+def enviar_ordem(par, direcao, valor, exp):
+    global API_GLOBAL
+    if not API_GLOBAL:
+        return
 
     hora = datetime.now().strftime("%H:%M:%S")
-    send_telegram(
-        f"⚡ *ORDEM EXECUTADA ({origem})*\n"
-        f"📊 *Par:* `{par}` | *Direção:* `{'🟢 CALL' if direcao=='CALL' else '🔴 PUT'}`\n"
-        f"💰 *Valor:* `R$ {valor:.2f}` | *Exp:* `{exp}M`"
-    )
+    notificar_telegram(f"⚡ *ORDEM EXECUTADA*\nPar: `{par}` | Dir: `{direcao}` | Valor: `R$ {valor:.2f}`")
 
-    id_ordem, tipo_exec = None, "DIGITAL"
+    id_ordem = None
     try:
-        _, id_dig = API_IQ_GLOBAL.buy_digital_spot(par, valor, direcao.lower(), exp)
-        if id_dig and id_dig != "error": id_ordem = id_dig
-    except Exception: pass
+        _, id_dig = API_GLOBAL.buy_digital_spot(par, valor, direcao.lower(), exp)
+        if id_dig and id_dig != "error":
+            id_ordem = id_dig
+    except Exception:
+        pass
 
     if not id_ordem:
         try:
-            status, id_bin = API_IQ_GLOBAL.buy(valor, par, direcao.lower(), exp)
-            if status and id_bin: id_ordem, tipo_exec = id_bin, "BINARY"
-        except Exception: pass
+            status, id_bin = API_GLOBAL.buy(valor, par, direcao.lower(), exp)
+            if status and id_bin:
+                id_ordem = id_bin
+        except Exception:
+            pass
 
     if id_ordem:
-        time.sleep(exp * 60 + 3)
-        lucro_real, resultado = 0.0, "LOSS"
+        time.sleep(exp * 60 + 2)
+        resultado = "LOSS"
         try:
-            if tipo_exec == "DIGITAL":
-                check, lucro = API_IQ_GLOBAL.check_win_digital_v2(id_ordem)
-                resultado = "WIN" if (check and lucro > 0) else "LOSS"
-                lucro_real = float(lucro)
-            else:
-                status, lucro = API_IQ_GLOBAL.check_win_v4(id_ordem)
-                resultado = "WIN" if (status and lucro > 0) else "LOSS"
-                lucro_real = float(lucro)
-        except Exception: pass
+            check, lucro = API_GLOBAL.check_win_digital_v2(id_ordem)
+            if check and lucro > 0:
+                resultado = "WIN"
+        except Exception:
+            pass
 
         if resultado == "WIN":
-            ESTADO_TERMINAL["placar_w"] += 1
+            ESTADO["placar_w"] += 1
         else:
-            ESTADO_TERMINAL["placar_l"] += 1
+            ESTADO["placar_l"] += 1
 
         try:
-            saldo = float(API_IQ_GLOBAL.get_balance())
-            ESTADO_TERMINAL["saldo_atual"] = saldo
-            ESTADO_TERMINAL["lucro_dia"] = saldo - ESTADO_TERMINAL["saldo_inicial"]
-        except Exception: pass
+            saldo = float(API_GLOBAL.get_balance())
+            ESTADO["saldo_atual"] = saldo
+            ESTADO["lucro_dia"] = saldo - ESTADO["saldo_inicial"]
+        except Exception:
+            pass
 
-        ESTADO_TERMINAL["historico_operacoes"].insert(0, {
-            "hora": hora, "par": par, "direcao": direcao, "score": score, "valor": valor, "resultado": resultado
-        })
-        if len(ESTADO_TERMINAL["historico_operacoes"]) > 15:
-            ESTADO_TERMINAL["historico_operacoes"].pop()
+        ESTADO["historico"].insert(0, {"hora": hora, "par": par, "direcao": direcao, "resultado": resultado})
+        notificar_telegram(f"🏁 *RESULTADO: {resultado}*\nAtivo: `{par}` | Saldo: `R$ {ESTADO['saldo_atual']:.2f}`")
 
-        send_telegram(
-            f"📋 *DESFECHO DA ORDEM*\n"
-            f"🏁 *Resultado:* `{'✅ WIN' if resultado=='WIN' else '❌ LOSS'}`\n"
-            f"💼 *Saldo:* `R$ {ESTADO_TERMINAL['saldo_atual']:.2f}`"
-        )
+def loop_motor():
+    global API_GLOBAL
+    from iqoptionapi.stable_api import IQ_Option
 
-class ApexEngineWorker:
-    def conectar(self):
-        global API_IQ_GLOBAL
-        from iqoptionapi.stable_api import IQ_Option
-        print(f"⚡ [APEX ENGINE] Conectando como {EMAIL_IQ}...", flush=True)
-        api = IQ_Option(EMAIL_IQ, SENHA_IQ)
-        check, reason = api.connect()
+    email = os.environ.get("IQ_EMAIL", "ceatecnology@gmail.com").strip()
+    senha = os.environ.get("IQ_PASSWORD", "").strip()
+    tipo = os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
-        if check:
-            api.change_balance(TIPO_CONTA)
-            saldo = float(api.get_balance())
-            ESTADO_TERMINAL["saldo_inicial"] = saldo
-            ESTADO_TERMINAL["saldo_atual"] = saldo
-            ESTADO_TERMINAL["tipo_conta"] = TIPO_CONTA
-            API_IQ_GLOBAL = api
-            send_telegram(f"🏛️ *TERMINAL PRO CONECTADO*\n💼 *Conta:* `{TIPO_CONTA}` | *Saldo:* `R$ {saldo:.2f}`")
-            return True
-        return False
+    while True:
+        if not API_GLOBAL:
+            print(f"Tentando autenticar como {email}...", flush=True)
+            api = IQ_Option(email, senha)
+            ok, _ = api.connect()
+            if ok:
+                api.change_balance(tipo)
+                saldo = float(api.get_balance())
+                ESTADO["saldo_inicial"] = saldo
+                ESTADO["saldo_atual"] = saldo
+                ESTADO["tipo_conta"] = tipo
+                API_GLOBAL = api
+                notificar_telegram(f"🤖 *TERMINAL ONLINE*\nConta: `{tipo}` | Saldo: `R$ {saldo:.2f}`")
+            else:
+                time.sleep(15)
+                continue
 
-    def loop(self):
-        while True:
-            if not API_IQ_GLOBAL:
-                if not self.conectar():
-                    time.sleep(15)
-                    continue
+        time.sleep(1)
+        seg = int(time.time()) % 60
 
-            time.sleep(1)
-            segundo = int(time.time()) % 60
-
-            # Varredura no segundo 00
-            if segundo in [0, 1] and ESTADO_TERMINAL["robo_ativo"]:
-                try:
-                    par = ESTADO_TERMINAL["ativo_selecionado"]
-                    velas_1h = API_IQ_GLOBAL.get_candles(par, 3600, 30, time.time())
-                    if velas_1h:
-                        df_1h = pd.DataFrame(velas_1h)
-                        ema200 = df_1h['close'].ewm(span=30, adjust=False).mean().iloc[-1]
-                        tend = "ALTA" if df_1h['close'].iloc[-1] > ema200 else "BAIXA"
-                        ESTADO_TERMINAL["indicadores"]["tendencia"] = tend
-
-                    velas_1m = API_IQ_GLOBAL.get_candles(par, 60, 30, time.time())
-                    if velas_1m and len(velas_1m) >= 20:
-                        df_1m = pd.DataFrame(velas_1m)
-                        corpo = abs(df_1m['close'].iloc[-1] - df_1m['open'].iloc[-1])
-                        pavio_inf = min(df_1m['close'].iloc[-1], df_1m['open'].iloc[-1]) - df_1m['min'].iloc[-1]
-                        
-                        score = 75.0
-                        if tend == "ALTA" and pavio_inf > corpo:
-                            score = 90.0
-                            ESTADO_TERMINAL["score_atual"] = score
-                            despachar_ordem_iq(par, "CALL", ENTRADA_BASE, 1, score, "AUTO")
-                except Exception:
-                    pass
+        # Disparo no segundo 00 da vela se confluência alta
+        if seg == 0 and ESTADO["robo_ativo"]:
+            try:
+                par = ESTADO["ativo"]
+                velas = API_GLOBAL.get_candles(par, 60, 20, time.time())
+                if velas and len(velas) >= 15:
+                    df = pd.DataFrame(velas)
+                    corpo = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
+                    pavio_inferior = min(df['close'].iloc[-1], df['open'].iloc[-1]) - df['min'].iloc[-1]
+                    
+                    if pavio_inferior > corpo * 1.6:
+                        ESTADO["score"] = 88.0
+                        threading.Thread(target=enviar_ordem, args=(par, "CALL", 20.0, 1), daemon=True).start()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
-    worker = ApexEngineWorker()
-    worker.loop()
+    loop_motor()
