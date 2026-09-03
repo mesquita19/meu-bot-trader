@@ -6,12 +6,12 @@ import json
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
-import numpy as np
 import requests
 
 # ================= ESTADO GLOBAL COMPARTILHADO =================
 ESTADO = {
-    "status": "Iniciando...",
+    "status": "Iniciando conexão com a corretora...",
+    "conectado": False,
     "robo_ativo": True,
     "email": os.environ.get("IQ_EMAIL", "ceatecnology@gmail.com").strip(),
     "tipo_conta": os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper(),
@@ -20,17 +20,13 @@ ESTADO = {
     "lucro_dia": 0.0,
     "placar_w": 0,
     "placar_l": 0,
-    "soros_estagio": 1,
     "ativo": "EURUSD-OTC",
-    "preco_atual": 0.0,
+    "preco_atual": "---",
     "score": 0.0,
-    "tendencia": "NEUTRO",
-    "adx": 0.0,
     "historico": []
 }
 
 API_GLOBAL = None
-LOCK_API = threading.Lock()
 
 # ================= SERVIDOR WEB RESPONSIVO =================
 class MobileTerminalHandler(BaseHTTPRequestHandler):
@@ -49,30 +45,30 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
                 par = self.path.split('par=')[1].split('&')[0]
                 ESTADO["ativo"] = par
 
-            velas_limpas = []
-            if API_GLOBAL:
+            velas_formatadas = []
+            if API_GLOBAL and ESTADO["conectado"]:
                 try:
                     raw = API_GLOBAL.get_candles(par, 60, 60, time.time())
-                    if raw:
+                    if raw and len(raw) > 0:
                         df = pd.DataFrame(raw).drop_duplicates(subset=['from']).sort_values('from')
                         for _, v in df.iterrows():
-                            velas_limpas.append({
+                            velas_formatadas.append({
                                 "time": int(v["from"]),
                                 "open": float(v["open"]),
                                 "high": float(v["max"]),
                                 "low": float(v["min"]),
                                 "close": float(v["close"])
                             })
-                        if velas_limpas:
-                            ESTADO["preco_atual"] = velas_limpas[-1]["close"]
+                        if velas_formatadas:
+                            ESTADO["preco_atual"] = str(round(velas_formatadas[-1]["close"], 5))
                 except Exception as e:
-                    print(f"Erro ao buscar velas: {e}", flush=True)
+                    print(f"Erro velas: {e}", flush=True)
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps(velas_limpas).encode('utf-8'))
+            self.wfile.write(json.dumps(velas_formatadas).encode('utf-8'))
             return
 
         self.send_response(200)
@@ -94,17 +90,21 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
             </style>
         </head>
         <body class="flex flex-col min-h-screen p-2 sm:p-4 space-y-3">
+            <!-- Barra de Status de Conexão -->
+            <div id="status-bar" class="p-2 rounded-lg text-center text-xs font-bold bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                Aguardando conexão com a corretora...
+            </div>
+
             <!-- Header Superior -->
             <header class="card p-3 rounded-xl flex items-center justify-between">
                 <div class="flex items-center space-x-2">
-                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <span id="dot-conexao" class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
                     <span class="font-black text-sm text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">APEX PRO</span>
                     <select id="par-select" onchange="mudarAtivo()" class="bg-slate-900 border border-slate-700 text-xs font-bold rounded px-2 py-1 text-white">
                         <option value="EURUSD-OTC">EUR/USD (OTC)</option>
                         <option value="GBPUSD-OTC">GBP/USD (OTC)</option>
                         <option value="USDJPY-OTC">USD/JPY (OTC)</option>
                         <option value="EURUSD">EUR/USD</option>
-                        <option value="BTCUSD">BTC/USD</option>
                     </select>
                 </div>
                 <div class="text-right font-mono">
@@ -134,7 +134,7 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
                 <div id="chart-area" class="w-full h-full"></div>
             </div>
 
-            <!-- Controles Manuais e Botões Grandes de Ação -->
+            <!-- Controles Manuais -->
             <div class="card p-3 rounded-xl space-y-3">
                 <div class="flex items-center justify-between gap-2 text-xs font-mono">
                     <div class="flex-1">
@@ -154,27 +154,15 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
                     </div>
                 </div>
 
-                <!-- Botões de Compra e Venda -->
                 <div class="grid grid-cols-2 gap-3 pt-1">
-                    <button onclick="dispararOrdem('CALL')" class="h-14 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-black text-sm flex items-center justify-center space-x-2 transition-all shadow-lg shadow-emerald-900/30">
+                    <button onclick="dispararOrdem('CALL')" class="h-14 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-black text-sm flex items-center justify-center space-x-2">
                         <span>▲</span>
                         <span>COMPRA (CALL)</span>
                     </button>
-                    <button onclick="dispararOrdem('PUT')" class="h-14 rounded-xl bg-rose-600 hover:bg-rose-500 active:scale-95 text-white font-black text-sm flex items-center justify-center space-x-2 transition-all shadow-lg shadow-rose-900/30">
+                    <button onclick="dispararOrdem('PUT')" class="h-14 rounded-xl bg-rose-600 hover:bg-rose-500 active:scale-95 text-white font-black text-sm flex items-center justify-center space-x-2">
                         <span>▼</span>
                         <span>VENDA (PUT)</span>
                     </button>
-                </div>
-            </div>
-
-            <!-- Histórico Recente -->
-            <div class="card p-3 rounded-xl space-y-2">
-                <div class="flex justify-between items-center text-xs border-b border-slate-800 pb-1">
-                    <span class="font-bold text-slate-300">ÚLTIMAS EXECUÇÕES</span>
-                    <span class="font-mono text-slate-400" id="val-placar">0W - 0L</span>
-                </div>
-                <div id="historico-container" class="space-y-1 text-xs font-mono max-h-24 overflow-y-auto">
-                    <div class="text-slate-500 text-center py-2">Nenhuma operação disparada ainda.</div>
                 </div>
             </div>
 
@@ -183,7 +171,6 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
                 const chart = LightweightCharts.createChart(container, {
                     layout: { background: { color: '#0f172a' }, textColor: '#64748b' },
                     grid: { vertLines: { color: '#1e293b' }, horzLines: { color: '#1e293b' } },
-                    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
                     timeScale: { timeVisible: true, secondsVisible: true, borderColor: '#1e293b' },
                     rightPriceScale: { borderColor: '#1e293b' }
                 });
@@ -194,11 +181,11 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
                     wickUpColor: '#10b981', wickDownColor: '#f43f5e'
                 });
 
-                function ajustarGrafico() {
+                function redimensionar() {
                     chart.resize(container.clientWidth, container.clientHeight);
                 }
-                window.addEventListener('resize', ajustarGrafico);
-                setTimeout(ajustarGrafico, 300);
+                window.addEventListener('resize', redimensionar);
+                setTimeout(redimensionar, 300);
 
                 async function puxarVelas() {
                     try {
@@ -207,54 +194,41 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
                         const dados = await res.json();
                         if (dados && dados.length > 0) {
                             candles.setData(dados);
-                            const ult = dados[dados.length - 1];
-                            document.getElementById('val-preco').innerText = ult.close.toFixed(5);
                         }
-                    } catch (e) {
-                        console.error("Erro nas velas:", e);
-                    }
+                    } catch (e) {}
                 }
 
                 async function puxarDados() {
                     try {
                         const res = await fetch('/api/dados');
                         const data = await res.json();
-                        document.getElementById('val-saldo').innerText = 'R$ ' + data.saldo_atual.toFixed(2);
-                        document.getElementById('tipo-conta').innerText = data.tipo_conta;
-                        document.getElementById('val-score').innerText = data.score.toFixed(1) + '%';
-                        document.getElementById('val-placar').innerText = `${data.placar_w}W - ${data.placar_l}L`;
 
-                        const lucroEl = document.getElementById('val-lucro');
-                        lucroEl.innerText = (data.lucro_dia >= 0 ? '+R$ ' : '-R$ ') + Math.abs(data.lucro_dia).toFixed(2);
-                        lucroEl.className = 'font-bold mt-0.5 ' + (data.lucro_dia >= 0 ? 'text-emerald-400' : 'text-rose-400');
+                        const statusBar = document.getElementById('status-bar');
+                        const dot = document.getElementById('dot-conexao');
+                        statusBar.innerText = data.status;
 
-                        if (data.historico.length > 0) {
-                            document.getElementById('historico-container').innerHTML = data.historico.map(h => `
-                                <div class="flex justify-between p-1 bg-slate-900 rounded">
-                                    <span>${h.hora} ${h.par}</span>
-                                    <span class="${h.direcao === 'CALL' ? 'text-emerald-400' : 'text-rose-400'} font-bold">${h.direcao}</span>
-                                    <span class="${h.resultado === 'WIN' ? 'text-emerald-400' : 'text-rose-400'} font-bold">${h.resultado}</span>
-                                </div>
-                            `).join('');
+                        if (data.conectado) {
+                            statusBar.className = 'p-2 rounded-lg text-center text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+                            dot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse';
+                        } else {
+                            statusBar.className = 'p-2 rounded-lg text-center text-xs font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30';
+                            dot.className = 'w-2.5 h-2.5 rounded-full bg-rose-500';
                         }
+
+                        document.getElementById('val-saldo').innerText = 'R$ ' + data.saldo_atual.toFixed(2);
+                        document.getElementById('val-preco').innerText = data.preco_atual;
+                        document.getElementById('tipo-conta').innerText = data.tipo_conta;
                     } catch (e) {}
                 }
 
-                function mudarAtivo() {
-                    puxarVelas();
-                }
+                function mudarAtivo() { puxarVelas(); }
 
                 async function toggleRobo() {
                     const btn = document.getElementById('btn-auto');
                     const resp = await fetch('/api/toggle', { method: 'POST' });
                     const res = await resp.json();
-                    if (res.ativo) {
-                        btn.innerText = 'LIGADO';
-                        btn.className = 'w-full bg-emerald-500 text-black font-black p-2 rounded-lg text-xs';
-                    } else {
-                        btn.innerText = 'PAUSADO';
-                        btn.className = 'w-full bg-amber-500 text-black font-black p-2 rounded-lg text-xs';
-                    }
+                    btn.innerText = res.ativo ? 'LIGADO' : 'PAUSADO';
+                    btn.className = res.ativo ? 'w-full bg-emerald-500 text-black font-black p-2 rounded-lg text-xs' : 'w-full bg-amber-500 text-black font-black p-2 rounded-lg text-xs';
                 }
 
                 async function dispararOrdem(direcao) {
@@ -268,7 +242,7 @@ class MobileTerminalHandler(BaseHTTPRequestHandler):
                     });
                 }
 
-                setInterval(puxarVelas, 2000);
+                setInterval(puxarVelas, 2500);
                 setInterval(puxarDados, 3000);
                 puxarVelas();
                 puxarDados();
@@ -309,25 +283,13 @@ def iniciar_servidor():
 
 threading.Thread(target=iniciar_servidor, daemon=True).start()
 
-# ================= EXECUÇÃO E MOTOR =================
-TG_TOKEN = os.environ.get("TG_TOKEN", "8601904952:AAHPJhTPKnE2UOoTrtm228cHCyFv8wNHxY8").strip()
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "999294230").strip()
-
-def notificar_telegram(texto):
-    if TG_TOKEN and TG_CHAT_ID:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": texto, "parse_mode": "Markdown"}, timeout=5)
-        except Exception:
-            pass
-
+# ================= COMUNICAÇÃO COM A CORRETORA =================
 def enviar_ordem(par, direcao, valor, exp):
     global API_GLOBAL
-    if not API_GLOBAL:
+    if not API_GLOBAL or not ESTADO["conectado"]:
         return
 
     hora = datetime.now().strftime("%H:%M:%S")
-    notificar_telegram(f"⚡ *ORDEM EXECUTADA*\nPar: `{par}` | Dir: `{direcao}` | Valor: `R$ {valor:.2f}`")
-
     id_ordem = None
     try:
         _, id_dig = API_GLOBAL.buy_digital_spot(par, valor, direcao.lower(), exp)
@@ -366,9 +328,6 @@ def enviar_ordem(par, direcao, valor, exp):
         except Exception:
             pass
 
-        ESTADO["historico"].insert(0, {"hora": hora, "par": par, "direcao": direcao, "resultado": resultado})
-        notificar_telegram(f"🏁 *RESULTADO: {resultado}*\nAtivo: `{par}` | Saldo: `R$ {ESTADO['saldo_atual']:.2f}`")
-
 def loop_motor():
     global API_GLOBAL
     from iqoptionapi.stable_api import IQ_Option
@@ -377,41 +336,43 @@ def loop_motor():
     senha = os.environ.get("IQ_PASSWORD", "").strip()
     tipo = os.environ.get("IQ_ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
+    if not senha:
+        ESTADO["status"] = "ERRO: Senha não configurada! Adicione IQ_PASSWORD no Render."
+        print(ESTADO["status"], flush=True)
+
     while True:
-        if not API_GLOBAL:
-            print(f"Tentando autenticar como {email}...", flush=True)
-            api = IQ_Option(email, senha)
-            ok, _ = api.connect()
-            if ok:
-                api.change_balance(tipo)
-                saldo = float(api.get_balance())
-                ESTADO["saldo_inicial"] = saldo
-                ESTADO["saldo_atual"] = saldo
-                ESTADO["tipo_conta"] = tipo
-                API_GLOBAL = api
-                notificar_telegram(f"🤖 *TERMINAL ONLINE*\nConta: `{tipo}` | Saldo: `R$ {saldo:.2f}`")
-            else:
-                time.sleep(15)
+        if not ESTADO["conectado"]:
+            if not senha:
+                ESTADO["status"] = "ERRO: Preencha IQ_PASSWORD no Render (Environment)"
+                time.sleep(5)
+                senha = os.environ.get("IQ_PASSWORD", "").strip()
                 continue
 
-        time.sleep(1)
-        seg = int(time.time()) % 60
-
-        # Disparo no segundo 00 da vela se confluência alta
-        if seg == 0 and ESTADO["robo_ativo"]:
+            ESTADO["status"] = f"Conectando a {email}..."
+            print(ESTADO["status"], flush=True)
+            
             try:
-                par = ESTADO["ativo"]
-                velas = API_GLOBAL.get_candles(par, 60, 20, time.time())
-                if velas and len(velas) >= 15:
-                    df = pd.DataFrame(velas)
-                    corpo = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
-                    pavio_inferior = min(df['close'].iloc[-1], df['open'].iloc[-1]) - df['min'].iloc[-1]
-                    
-                    if pavio_inferior > corpo * 1.6:
-                        ESTADO["score"] = 88.0
-                        threading.Thread(target=enviar_ordem, args=(par, "CALL", 20.0, 1), daemon=True).start()
-            except Exception:
-                pass
+                api = IQ_Option(email, senha)
+                ok, reason = api.connect()
+                if ok:
+                    api.change_balance(tipo)
+                    saldo = float(api.get_balance())
+                    ESTADO["saldo_inicial"] = saldo
+                    ESTADO["saldo_atual"] = saldo
+                    ESTADO["tipo_conta"] = tipo
+                    ESTADO["conectado"] = True
+                    ESTADO["status"] = f"Conectado com sucesso ({tipo})!"
+                    API_GLOBAL = api
+                    print("✅ Conectado à corretora!", flush=True)
+                else:
+                    ESTADO["status"] = f"Falha no login: {reason}. Verifique email e senha."
+                    print(ESTADO["status"], flush=True)
+                    time.sleep(15)
+            except Exception as e:
+                ESTADO["status"] = f"Erro na conexão: {e}"
+                time.sleep(10)
+
+        time.sleep(1)
 
 if __name__ == "__main__":
     loop_motor()
